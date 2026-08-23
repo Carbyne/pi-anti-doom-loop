@@ -274,6 +274,36 @@ export class LoopDetector {
     return Result.err(undefined);
   }
 
+  /**
+   * Duplicate identical (tool, args) calls batched inside ONE assistant
+   * message (parallel tool-call spam). Degenerate models sometimes emit a
+   * single response containing hundreds of the same no-op call; per-call
+   * detection never sees it as a streak because every call arrives at once.
+   * Fires at textRepeatThreshold duplicates of any one signature. The calls
+   * are already emitted when this runs, so the controller aborts instead of
+   * steering — a steer cannot retract them.
+   */
+  checkDuplicateCalls(
+    entries: { toolName: string; input: ToolInput }[],
+  ): Result<{ reason: string }, undefined> {
+    const counts = new Map<string, { n: number; name: string; input: ToolInput }>();
+    for (const e of entries) {
+      if (this.opts.toolExclude.has(e.toolName)) continue;
+      const sig = signature(e.toolName, e.input);
+      const cur = counts.get(sig) ?? { n: 0, name: e.toolName, input: e.input };
+      cur.n++;
+      counts.set(sig, cur);
+      if (cur.n >= this.opts.textRepeatThreshold) {
+        return Result.ok({
+          reason:
+            `Assistant message contains ${cur.n} identical "${e.toolName}" calls ` +
+            `("${truncate(stringify(e.input), 60)}"). You appear to be in a loop.`,
+        });
+      }
+    }
+    return Result.err(undefined);
+  }
+
   /** Trail of results that are errors of this same tool (consecutive). */
   private consecutiveFails(toolName: string): number {
     let n = 0;
@@ -576,6 +606,26 @@ if (import.meta.main) {
   assert.equal(clamped.textRepeatThreshold, 3, "negative falls back to default");
   const two = readOptions({ PI_ANTI_LOOP_REPEATS: "2" });
   assert.equal(two.repeatThreshold, 2, "2 is the minimum accepted");
+
+  // 13. within-one-message duplicate tool-call spam (degenerate parallel batch)
+  d.reset();
+  const spamHit = d.checkDuplicateCalls(
+    Array.from({ length: 3 }, () => ({
+      toolName: "bash",
+      input: { command: "true" } as ToolInput,
+    })),
+  );
+  assert.ok(spamHit.isOk(), "3 identical calls in one message should fire");
+  if (spamHit.isOk()) assert.match(spamHit.value.reason, /identical "bash" calls/);
+  assert.ok(
+    d
+      .checkDuplicateCalls([
+        { toolName: "read", input: { path: "a.ts" } },
+        { toolName: "read", input: { path: "b.ts" } },
+      ])
+      .isErr(),
+    "distinct parallel args are not spam",
+  );
 
   console.log("detector self-check: all assertions passed");
 }

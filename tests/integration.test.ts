@@ -96,6 +96,30 @@ describe("controller: message lifecycle", () => {
     assert.ok(hit !== null && /identical text 3 times/.test(hit.reason));
   });
 
+  it("aborts on duplicate identical tool calls batched in ONE assistant message", () => {
+    const c = createController();
+    const spam = (n: number, command = "true") =>
+      Array.from({ length: n }, () => ({ type: "toolCall", name: "bash", arguments: { command } }));
+    const hit = c.onMessageEnd("assistant", spam(3) as any);
+    assert.ok(hit !== null && hit.action === "abort" && !hit.resume);
+    assert.match(hit!.reason, /identical "bash" calls/);
+  });
+
+  it("allows parallel calls with distinct args or below-threshold duplicates", () => {
+    const c = createController();
+    const distinct = [
+      { type: "toolCall", name: "read", arguments: { path: "a.ts" } },
+      { type: "toolCall", name: "read", arguments: { path: "b.ts" } },
+      { type: "toolCall", name: "bash", arguments: { command: "npm test" } },
+    ];
+    assert.equal(c.onMessageEnd("assistant", distinct as any), null);
+    const two = [
+      { type: "toolCall", name: "bash", arguments: { command: "true" } },
+      { type: "toolCall", name: "bash", arguments: { command: "true" } },
+    ];
+    assert.equal(c.onMessageEnd("assistant", two as any), null);
+  });
+
   it("ignores non-assistant roles and non-text content", () => {
     const c = createController();
     assert.equal(c.onMessageEnd("user", [{ type: "text", text: "x" }]), null);

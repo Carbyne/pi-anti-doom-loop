@@ -37,10 +37,13 @@ export interface CommandCtxLite {
   ui: { notify(message: string, level: string): void };
 }
 
-/** One content block of an assistant message; only text blocks carry text. */
+/** One content block of an assistant message; text blocks carry text, tool
+ * calls carry name + arguments (pi's AgentMessage block shape). */
 export interface MessageContentBlock {
   readonly type: string;
   readonly text?: string;
+  readonly name?: string;
+  readonly arguments?: unknown;
 }
 
 /** The list of content blocks of an assistant message. */
@@ -115,6 +118,16 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
     onMessageEnd(role, content) {
       if (suspended) return null;
       if (role !== "assistant") return null;
+
+      // Within-message duplicate tool-call spam fires first: it aborts (the
+      // calls are already emitted, steering cannot retract them), so it must
+      // outrank the steer-able text ladder.
+      const calls = content
+        .filter((c) => c.type === "toolCall")
+        .map((c) => ({ toolName: c.name ?? "", input: c.arguments as ToolInput }));
+      const batch = detector.checkDuplicateCalls(calls);
+      if (batch.isOk()) return { reason: batch.value.reason, action: "abort", resume: false };
+
       const text = extractText(content);
       if (!text) return null;
       const hit = detector.checkText(text);

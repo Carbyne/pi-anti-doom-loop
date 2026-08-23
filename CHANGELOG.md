@@ -2,6 +2,12 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.0.8] — 2026-08-24
+
+### Added
+
+- **Within-message tool-call spam detection** — `onMessageEnd` now inspects the assistant message's `toolCall` blocks and aborts immediately when `textRepeatThreshold` identical `(tool, args)` calls are batched in ONE message (`LoopDetector.checkDuplicateCalls`). Catches degenerate parallel batches — e.g. a single response emitting 1405 identical `bash "true"` calls (observed in production) — which per-call detection never sees as a streak because every call arrives at once, and which can be aborted before any call executes. Respects `PI_ANTI_LOOP_TOOLS_EXCLUDE`; aborts rather than steers since steering cannot retract emitted calls.
+
 ## [0.0.7] — 2026-08-13
 
 ### Changed
