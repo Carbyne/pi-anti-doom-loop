@@ -9,8 +9,11 @@
  *   detection #1 → steer  (inject guidance, let the agent continue)
  *   detection #2 → abort + resume (stop the run, queue one fresh directive)
  *   detection #3+ → abort for real (hand back to the user)
- * The resume budget is session-scoped: `reset()` (per user prompt) keeps it,
- * a fresh session (new controller) starts over.
+ * The auto-resume budget is re-armed on each genuine user prompt (via the
+ * `input` event → `resetPromptBudget()`), so an explicit "continue" always gets
+ * a fresh steer→abort→resume; the model's own auto-resume continuations (custom
+ * messages that do not fire `input`) stay bounded to RESUME_BUDGET, so a stuck
+ * model cannot cycle steer→abort→resume forever. A fresh session starts over.
  */
 import { LoopDetector, detectRepetition, readOptions, truncate } from "./detector.ts";
 import type { LoopOptions, ToolInput } from "./detector.ts";
@@ -69,7 +72,7 @@ export interface TextLoopOutcome {
   resume: boolean;
 }
 
-/** How many auto-resumes per session before we hand control back for real. */
+/** Auto-resumes allowed per user prompt before we hand control back for real. */
 export const RESUME_BUDGET = 1;
 
 /** Re-evaluate the mid-stream guard only every this many new chars (cheap throttle). */
@@ -92,6 +95,8 @@ export interface AntiLoopController {
   onMessageUpdate(role: string, deltaType: string, delta: string): TextLoopOutcome | null;
   /** Full reset (session start, user prompt, /loopcheck reset). */
   reset(): void;
+  /** Re-arm the auto-resume budget on a genuine user prompt (keeps lifetime counters). */
+  resetPromptBudget(): void;
   /** Suspend detection until the next reset (escape hatch for intentional repetition). */
   suspend(): void;
   resume(): void;
@@ -232,7 +237,15 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       streamSteered = false;
       // resumes/steers/aborts are intentionally NOT reset here: they are
       // session-scoped so a stuck model cannot cycle steer→abort forever and
-      // /loopcheck can report lifetime counters.
+      // /loopcheck can report lifetime counters. The auto-resume budget is
+      // re-armed separately by resetPromptBudget() on a genuine user prompt.
+    },
+
+    resetPromptBudget() {
+      // Fresh user intent re-arms the single auto-resume. The model's own
+      // auto-resume continuations never fire `input`, so this stays bounded and
+      // cannot re-enable an infinite auto-cycle within a single prompt.
+      resumes = 0;
     },
 
     suspend() {

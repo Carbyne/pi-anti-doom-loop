@@ -17,6 +17,7 @@ import {
   DEFAULT_OPTIONS,
   type LoopOptions,
 } from "../extensions/detector.ts";
+import { createController } from "../extensions/controller.ts";
 
 const opts: LoopOptions = {
   repeatThreshold: 3,
@@ -535,5 +536,44 @@ describe("detectRepetition (mid-stream intra-turn collapse)", () => {
   it("still fires through small per-block noise", () => {
     const s = "ductductxuct".repeat(40); // every unit has 1 mismatched char region
     assert.ok(detectRepetition(s, STREAM_CFG), "12% noise tolerance catches it");
+  });
+});
+
+describe("mid-stream abort + auto-resume budget re-arm", () => {
+  // Feed a 'duct' collapse into a fresh assistant message until the controller
+  // aborts; returns that abort outcome (or the last decision if it never did).
+  function runDoomToAbort(
+    c: ReturnType<typeof createController>,
+  ): { action: string; resume: boolean } | null {
+    c.onMessageStart();
+    let last: { action: string; resume: boolean } | null = null;
+    for (let i = 0; i < 16; i++) {
+      const o = c.onMessageUpdate("assistant", "text", "duct".repeat(20));
+      if (o) {
+        last = { action: o.action, resume: o.resume };
+        if (o.action === "abort") return last;
+      }
+    }
+    return last;
+  }
+
+  it("auto-resumes the first collapse, not a second in one prompt, then re-arms on user input", () => {
+    const c = createController();
+
+    const a1 = runDoomToAbort(c);
+    assert.equal(a1?.action, "abort");
+    assert.equal(a1?.resume, true, "first collapse in a prompt auto-resumes");
+
+    // The auto-resume continuation loops again — the budget for THIS prompt is
+    // already spent, so it aborts for real and hands control back (no resume).
+    const a2 = runDoomToAbort(c);
+    assert.equal(a2?.action, "abort");
+    assert.equal(a2?.resume, false, "budget spent → no extra auto-resume within the same prompt");
+
+    // The user types "continue": the input event re-arms the single auto-resume.
+    c.resetPromptBudget();
+    const a3 = runDoomToAbort(c);
+    assert.equal(a3?.action, "abort");
+    assert.equal(a3?.resume, true, "a genuine new user prompt re-arms the auto-resume");
   });
 });

@@ -76,8 +76,15 @@ export default function (pi: PiLike): void {
   pi.on("session_start", () => reset());
 
   // Fresh counters per user prompt: only the loop happening *right now* counts.
-  // Internal reset keeps session-scoped steers/aborts/resume budget.
+  // Internal reset keeps session-scoped steers/aborts; the auto-resume budget is
+  // re-armed separately on the genuine user `input` event below.
   pi.on("before_agent_start", () => controller.reset());
+
+  // A real user prompt is fresh intent → re-arm the single auto-resume, so an
+  // explicit "continue" gets the steer→abort→resume treatment every time (not
+  // just the first). The model's own auto-resume continuations are custom
+  // messages that never fire `input`, so a stuck model still can't auto-cycle.
+  pi.on("input", () => controller.resetPromptBudget());
 
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
     // The pi event delivers untyped tool arguments; decode them into the

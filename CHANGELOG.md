@@ -2,6 +2,22 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.1.1] — Carbyne fork
+
+### Fixed
+
+- **The fresh-approach resume directive now fires on every user prompt, not just the first.**
+  The auto-resume budget was session-scoped, so after the very first abort in a session consumed
+  the single resume, every later `duct`-collapse aborted and just **stopped** without the
+  "start over with a different approach" prompt — even across separate manual "continue" turns.
+  The budget is now re-armed on the genuine user `input` event (`resetPromptBudget()`), so an
+  explicit "continue" always gets the steer→abort→resume treatment again. The model's own
+  auto-resume continuations are custom messages that never fire `input`, so a truly stuck model
+  still can't auto-cycle past `RESUME_BUDGET` within a single prompt — the anti-infinite-loop
+  bound is preserved.
+- The mid-stream handler optional-chains `ctx.ui?.notify?.(...)` so a missing headless `ui` can't
+  throw before `ctx.abort()` (which would defeat the guard inside a `pi -p` worker).
+
 ## [0.1.0] — Carbyne fork
 
 ### Added

@@ -49,10 +49,13 @@ the exact same call, the turn is **aborted**.
 The first text-loop detection **steers** the agent mid-run (injects guidance,
 lets it continue). If it persists, the run is **aborted** and **one** fresh-
 resume directive is queued so work continues with a new approach. If it still
-loops after that, the run aborts for real and control returns to you — the
-auto-resume budget is capped so a truly stuck model can't cycle forever.
-Counters reset on every user prompt, so a task legitimately repeated later in
-the same session is never a false positive.
+loops after that, the run aborts for real and control returns to you. The
+auto-resume budget is **one per user prompt**: the model's own auto-resume
+continuations can't earn another (so a truly stuck model can't cycle forever),
+but when **you** send a new message the budget re-arms — so typing "continue"
+always gets the full steer→abort→resume treatment again, not just the first time.
+Detection counters reset on every user prompt, so a task legitimately repeated
+later in the same session is never a false positive.
 
 ### Mid-stream guard (single never-ending turn)
 
