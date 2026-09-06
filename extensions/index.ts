@@ -149,14 +149,14 @@ export default function (pi: PiLike): void {
     if (outcome === null) return;
 
     if (outcome.action === "steer") {
-      ctx.ui.notify(`Anti-doom-loop: ${outcome.reason}`, "warning");
+      ctx.ui?.notify?.(`Anti-doom-loop: ${outcome.reason}`, "warning");
       pi.sendMessage?.(
         { customType: "anti-doom-loop", content: STEER_TEXT, display: true },
         { deliverAs: "steer", triggerTurn: true },
       );
       return;
     }
-    ctx.ui.notify(`Anti-doom-loop: ${outcome.reason}`, "error");
+    ctx.ui?.notify?.(`Anti-doom-loop: ${outcome.reason}`, "error");
     ctx.abort();
     if (outcome.resume) {
       pi.sendMessage?.(
