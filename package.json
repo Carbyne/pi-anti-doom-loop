@@ -36,8 +36,7 @@
     "guard": "node scripts/guard-publish.ts",
     "lint": "oxlint --deny-warnings",
     "format": "oxfmt .",
-    "format:check": "oxfmt --check .",
-    "prepare": "effect-tsgo patch --no-typescript --oxlint"
+    "format:check": "oxfmt --check ."
   },
   "dependencies": {
     "better-result": "^3.0.0",
