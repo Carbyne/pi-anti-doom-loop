@@ -2,6 +2,21 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.1.2] — Carbyne fork
+
+### Added
+
+- **Thinking reduction on loop.** When any loop signal fires (tool-call block, text loop,
+  or the mid-stream collapse detector), the guard now temporarily lowers the agent's reasoning
+  effort via `pi.setThinkingLevel` so the corrective steer/abort + auto-resume turn reasons
+  less — cheaper and less prone to the repetition collapse, which lives in reasoning output.
+  The original level is restored on the next genuine user prompt (scoped to the stuck episode,
+  never sticks); `onSessionStart`/`/loopcheck reset` also clear it. No-op when reasoning is
+  already `off`/`minimal`, so `--thinking off` workers (e.g. observational-memory) are untouched.
+  Target level via `PI_ANTI_LOOP_THINK_ON_LOOP` (default `off`); disable with
+  `PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE=1`. The governor is a pure, unit-tested module
+  (`createThinkingGovernor`); `index.ts` wires it to pi's event loop. 7 new tests.
+
 ## [0.1.1] — Carbyne fork
 
 ### Fixed

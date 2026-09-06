@@ -18,6 +18,96 @@ import {
   type LoopOptions,
 } from "../extensions/detector.ts";
 import { createController } from "../extensions/controller.ts";
+import { createThinkingGovernor } from "../extensions/controller.ts";
+
+/** A fake pi thinking api that records the last set value + current level. */
+function fakeThinking(start: string) {
+  const calls: string[] = [];
+  return {
+    calls,
+    current: () => (calls.length ? calls[calls.length - 1]! : start),
+    getThinkingLevel: () => (calls.length ? calls[calls.length - 1]! : start),
+    setThinkingLevel: (level: string) => {
+      calls.push(level);
+    },
+  };
+}
+
+describe("thinking governor (reduce on loop, restore on prompt)", () => {
+  const GOV = {
+    enabled: true,
+    target: "off",
+    alreadyLow: new Set(["off", "minimal"]),
+  };
+
+  it("drops a reasoning level to target when a loop is detected", () => {
+    const g = createThinkingGovernor(GOV);
+    const api = fakeThinking("high");
+    g.onLoop(api);
+    assert.equal(api.calls[0], "off");
+    assert.ok(g.isLowered());
+  });
+
+  it("restores the remembered level on the next prompt", () => {
+    const g = createThinkingGovernor(GOV);
+    const api = fakeThinking("high");
+    g.onLoop(api);
+    assert.ok(g.isLowered());
+    g.onPrompt(api);
+    assert.equal(api.calls[api.calls.length - 1], "high");
+    assert.ok(!g.isLowered());
+    // second prompt is a no-op (nothing pending)
+    const before = api.calls.length;
+    g.onPrompt(api);
+    assert.equal(api.calls.length, before);
+  });
+
+  it("does nothing when already low enough (off/minimal)", () => {
+    for (const lvl of ["off", "minimal"]) {
+      const g = createThinkingGovernor(GOV);
+      const api = fakeThinking(lvl);
+      g.onLoop(api);
+      assert.equal(api.calls.length, 0);
+      assert.ok(!g.isLowered());
+    }
+  });
+
+  it("is inert when disabled", () => {
+    const g = createThinkingGovernor({ ...GOV, enabled: false });
+    const api = fakeThinking("high");
+    g.onLoop(api);
+    assert.equal(api.calls.length, 0);
+  });
+
+  it("reduces only once per episode", () => {
+    const g = createThinkingGovernor(GOV);
+    const api = fakeThinking("medium");
+    g.onLoop(api);
+    g.onLoop(api);
+    g.onLoop(api);
+    assert.equal(api.calls.length, 1); // exactly one set to target
+    assert.equal(api.calls[0], "off");
+  });
+
+  it("does not reduce when current already equals target", () => {
+    const g = createThinkingGovernor(GOV);
+    const api = fakeThinking("off");
+    g.onLoop(api);
+    assert.equal(api.calls.length, 0);
+  });
+
+  it("onSessionStart forgets a pending reduction without restoring", () => {
+    const g = createThinkingGovernor(GOV);
+    const api = fakeThinking("high");
+    g.onLoop(api);
+    assert.ok(g.isLowered());
+    g.onSessionStart();
+    assert.ok(!g.isLowered());
+    const before = api.calls.length;
+    g.onPrompt(api);
+    assert.equal(api.calls.length, before); // no restore scheduled
+  });
+});
 
 const opts: LoopOptions = {
   repeatThreshold: 3,

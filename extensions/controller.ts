@@ -42,6 +42,72 @@ export interface CtxLite {
   ui: { notify(message: string, level: string): void };
   abort(): void;
 }
+
+/** The thinking knobs the governor uses; these live on pi's ExtensionAPI (the
+ * `pi` object), not on the event ctx, so this is a structural subset of that. */
+export interface ThinkingApiLite {
+  getThinkingLevel?(): string;
+  setThinkingLevel?(level: string): void;
+}
+
+export interface ThinkingNotifyLite {
+  notify(message: string, level: string): void;
+}
+
+export interface ThinkingGovernorOptions {
+  /** Feature switch; when false the governor is inert. */
+  enabled: boolean;
+  /** Level to drop to while a loop is being broken (clamped to the model). */
+  target: string;
+  /** Levels already low enough that reducing is pointless (e.g. off/minimal). */
+  alreadyLow: ReadonlySet<string>;
+}
+
+/**
+ * Decides when to temporarily reduce the agent's reasoning effort on a detected
+ * loop. Reasoning output is the usual breeding ground for repetition collapses,
+ * so a corrective turn that reasons less is both cheaper and less loop-prone.
+ * The original level is remembered and restored on the next genuine user prompt,
+ * so this is scoped to the stuck episode and never silently sticks. Pure and
+ * pi-free (driven with a fake api in tests); `index.ts` wires it to pi.
+ */
+export interface ThinkingGovernor {
+  /** Called whenever a loop is detected (steer or abort path). */
+  onLoop(api: ThinkingApiLite, ui?: ThinkingNotifyLite): void;
+  /** Restore the remembered level on a fresh user prompt. */
+  onPrompt(api: ThinkingApiLite, ui?: ThinkingNotifyLite): void;
+  /** Forget pending state (session start / manual reset). */
+  onSessionStart(): void;
+  /** True while a reduced level is in effect awaiting restore. */
+  isLowered(): boolean;
+}
+
+export function createThinkingGovernor(o: ThinkingGovernorOptions): ThinkingGovernor {
+  let loweredFrom: string | undefined;
+  return {
+    onLoop(api, ui) {
+      if (!o.enabled || loweredFrom !== undefined) return; // one reduce per episode
+      const cur = api.getThinkingLevel?.();
+      if (!cur || cur === o.target || o.alreadyLow.has(cur)) return; // nothing to gain
+      api.setThinkingLevel?.(o.target);
+      loweredFrom = cur;
+      ui?.notify(`Anti-doom-loop: lowered thinking ${cur} → ${o.target} to break the loop`, "info");
+    },
+    onPrompt(api, ui) {
+      if (loweredFrom === undefined) return;
+      const restore = loweredFrom;
+      loweredFrom = undefined;
+      api.setThinkingLevel?.(restore);
+      ui?.notify(`Anti-doom-loop: restored thinking to ${restore}`, "info");
+    },
+    onSessionStart() {
+      loweredFrom = undefined;
+    },
+    isLowered() {
+      return loweredFrom !== undefined;
+    },
+  };
+}
 export interface CommandCtxLite {
   ui: { notify(message: string, level: string): void };
 }

@@ -19,6 +19,13 @@
  * instructive reason (that is the steer); re-issuing the exact same blocked
  * call aborts the turn.
  *
+ * On a detected loop the guard also *reduces reasoning effort* for the corrective
+ * turn (via `pi.setThinkingLevel`), since repetition collapses breed in reasoning
+ * output — a less-reasoning turn is cheaper and less loop-prone. The original
+ * level is restored on the next genuine user prompt. Disable with
+ * `PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE=1`; set the target level with
+ * `PI_ANTI_LOOP_THINK_ON_LOOP` (default `off`).
+ *
  * Counters reset on every user prompt, so a task legitimately repeated later
  * in the session is never a false positive. Disable with PI_ANTI_LOOP_DISABLE=1.
  *
@@ -28,6 +35,7 @@
  */
 import {
   createController,
+  createThinkingGovernor,
   type AntiLoopController,
   type CommandCtxLite,
   type CtxLite,
@@ -54,6 +62,9 @@ export interface PiLike {
     content: { customType?: string; content?: string; display?: boolean },
     options?: { deliverAs?: "steer" | "followUp" | "nextTurn"; triggerTurn?: boolean },
   ): void;
+  /** Thinking controls live on pi's ExtensionAPI (structural subset). */
+  getThinkingLevel?(): string;
+  setThinkingLevel?(level: string): void;
 }
 
 /** Injected on the first loop detection — steer the agent back on track. */
@@ -68,12 +79,33 @@ const RESUME_TEXT =
   "Start over with a genuinely different approach: do not repeat the previous investigation steps. " +
   "Re-read the task, choose one new action, execute it, then report results.";
 
+/** Only the `input` event's presence matters here; its payload is ignored. */
+interface InputEventLite {
+  type?: string;
+}
+
 export default function (pi: PiLike): void {
   if (process.env.PI_ANTI_LOOP_DISABLE === "1") return;
 
   let controller: AntiLoopController = createController(readOptions());
 
-  pi.on("session_start", () => reset());
+  // On a detected loop, temporarily drop reasoning effort: the corrective turn
+  // that reasons less is both cheaper and far less prone to the repetition
+  // collapse (which lives in reasoning output). The original level is restored
+  // on the next genuine user prompt. Disabled with PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE=1;
+  // the target level is PI_ANTI_LOOP_THINK_ON_LOOP (default "off").
+  const VALID_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  const rawTarget = (process.env.PI_ANTI_LOOP_THINK_ON_LOOP ?? "off").trim().toLowerCase();
+  const thinking = createThinkingGovernor({
+    enabled: process.env.PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE !== "1",
+    target: VALID_LEVELS.has(rawTarget) ? rawTarget : "off",
+    alreadyLow: new Set(["off", "minimal"]),
+  });
+
+  pi.on("session_start", () => {
+    reset();
+    thinking.onSessionStart();
+  });
 
   // Fresh counters per user prompt: only the loop happening *right now* counts.
   // Internal reset keeps session-scoped steers/aborts; the auto-resume budget is
@@ -84,7 +116,11 @@ export default function (pi: PiLike): void {
   // explicit "continue" gets the steer→abort→resume treatment every time (not
   // just the first). The model's own auto-resume continuations are custom
   // messages that never fire `input`, so a stuck model still can't auto-cycle.
-  pi.on("input", () => controller.resetPromptBudget());
+  // It is also where we undo a thinking reduction left over from a prior loop.
+  pi.on("input", (_e: InputEventLite, ctx: CtxLite) => {
+    controller.resetPromptBudget();
+    thinking.onPrompt(pi, ctx?.ui);
+  });
 
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
     // The pi event delivers untyped tool arguments; decode them into the
@@ -116,6 +152,7 @@ export default function (pi: PiLike): void {
       event.message.content as MessageContent,
     );
     if (outcome === null) return;
+    thinking.onLoop(pi, ctx.ui);
 
     if (outcome.action === "steer") {
       ctx.ui.notify(`Anti-doom-loop: ${outcome.reason}`, "warning");
@@ -154,6 +191,7 @@ export default function (pi: PiLike): void {
     if (deltaType === null) return; // toolcall_delta etc. is not generated prose
     const outcome = controller.onMessageUpdate("assistant", deltaType, ae.delta ?? "");
     if (outcome === null) return;
+    thinking.onLoop(pi, ctx.ui);
 
     if (outcome.action === "steer") {
       ctx.ui?.notify?.(`Anti-doom-loop: ${outcome.reason}`, "warning");
@@ -179,6 +217,7 @@ export default function (pi: PiLike): void {
       const arg = args.trim().toLowerCase();
       if (arg === "reset") {
         reset();
+        thinking.onSessionStart();
         ctx.ui.notify("Anti-doom-loop: counters reset", "info");
         return;
       }
