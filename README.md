@@ -47,13 +47,17 @@ the exact same call, the turn is **aborted**.
 ### Escalation (text loops): steer → abort → bounded resume
 
 The first text-loop detection **steers** the agent mid-run (injects guidance,
-lets it continue). If it persists, the run is **aborted** and **one** fresh-
-resume directive is queued so work continues with a new approach. If it still
-loops after that, the run aborts for real and control returns to you. The
-auto-resume budget is **one per user prompt**: the model's own auto-resume
-continuations can't earn another (so a truly stuck model can't cycle forever),
-but when **you** send a new message the budget re-arms — so typing "continue"
-always gets the full steer→abort→resume treatment again, not just the first time.
+lets it continue). If it persists, the run is **aborted** and a fresh-resume
+directive is queued so work continues with a new approach. If it still loops
+after the resume, the corrective turn re-collapses and gets a **second** resume
+(so a one-off spin on the new attempt still recovers). Only when that second
+attempt also spins does the run abort for real and control return to you. The
+auto-resume budget is **two per user prompt**: the model's own auto-resume
+continuations draw down the budget, so a truly stuck model can't cycle forever,
+but when **you** send a new message the budget re-arms to 2 — so typing "continue"
+always gets the full steer→abort→resume→resume treatment again, not just the first
+time. (Budget `1` was the old setting and made a *second* collapse look "stuck":
+it aborted with no resume and never came back.)
 Detection counters reset on every user prompt, so a task legitimately repeated
 later in the same session is never a false positive.
 
@@ -62,8 +66,10 @@ later in the same session is never a false positive.
 The text signals above all evaluate at `message_end`. A model that collapses into an
 intra-token loop ("`BSRRductductduct…`") emits **one turn that never ends**, so
 `message_end` never fires and none of them can catch it — only a wall-clock timeout would.
-The mid-stream guard watches the `message_update` **text/thinking deltas** and applies the
-same steer → abort → bounded-resume ladder:
+The mid-stream guard watches the `message_update` **text/thinking deltas**. Because
+this path only fires for a **sustained** burst (a transient blip would end its turn
+before the window fills), it **aborts in one shot and queues a fresh-resume** rather
+than wasting a steer the same model would just collapse through:
 
 - it fires when the trailing `PI_ANTI_LOOP_STREAM_MIN_CHARS` chars are tiled by a unit of at
   most `PI_ANTI_LOOP_STREAM_MAX_PERIOD` chars, repeated at least `PI_ANTI_LOOP_STREAM_REPEATS`
@@ -81,19 +87,27 @@ acts on the user's own interactive turn, not just cheap worker subprocesses.
 
 Repetition collapses almost always live in the model's **reasoning** output — and a
 reasoning turn that spins is both expensive and self-reinforcing. So the moment any
-loop signal fires, the guard temporarily **drops the thinking level** (via
-`pi.setThinkingLevel`, clamped to the model's capabilities) so the auto-resume **corrective
-reply reasons less**. The reduction is bound to **exactly that one turn**: armed when the
-loop is detected, applied on the corrective turn's `turn_start`, and undone on its
-`turn_end` — so it never bleeds into the autonomous turns that follow. (A genuine user
-prompt is only a final safety net for an arm/undo that somehow never completed.) It is a
-no-op when reasoning is already `off`/`minimal` (e.g. an
-observational-memory worker running `--thinking off`), so it never touches non-reasoning runs.
+loop signal fires, the guard **drops reasoning on the single corrective request**
+that follows — the fresh-approach turn that reasons nothing is both cheaper and far
+less likely to re-collapse. It rewrites that one request's outgoing provider payload
+on pi's `before_provider_request` hook, one-shot: exactly the corrective request is
+touched and nothing bleeds into the turns that follow.
 
-| Var                                  | Default | Meaning                                                               |
-| ------------------------------------ | ------- | --------------------------------------------------------------------- |
-| `PI_ANTI_LOOP_THINK_ON_LOOP`         | `off`   | Level to drop to while breaking a loop: `off`/`minimal`/`low`/…       |
-| `PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE` | —       | Set to `1` to disable the reduction (keep the model's thinking level) |
+Why the payload, not `pi.setThinkingLevel`? pi's low-level loop snapshots
+`config.reasoning` from the session level **once at run start** and reuses it for
+every turn in that run — and the auto-resume corrective turn is drained *inside the
+same run* — so a mid-run `setThinkingLevel` is structurally ignored (and pollutes
+the session default). Rewriting the actual wire payload is the only lever that lands
+on the corrective request. It is a no-op when reasoning is already `off`/`minimal`
+(e.g. an observational-memory worker running `--thinking off`, which is disabled
+properly via the gateway's `off → "none"` mapping), so it never touches
+non-reasoning runs.
+
+| Var                                  | Default | Meaning                                                                     |
+| ------------------------------------ | ------- | --------------------------------------------------------------------------- |
+| `PI_ANTI_LOOP_THINK_ON_LOOP`         | `off`   | Level to drop the corrective request to: `off`/`minimal`/`low`/…       |
+| `PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE` | —       | Set to `1` to disable the reduction (keep the model's reasoning)      |
+| `PI_ANTI_LOOP_THINK_OFF_WIRE`        | `none`  | The `reasoning_effort` wire value meaning "off" (vLLM uses `none`)   |
 
 > Note: workers that already run with reasoning off get no benefit (nothing to reduce).
 > The real fix for a model that reasons despite `--thinking off` is the model's

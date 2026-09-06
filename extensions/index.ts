@@ -19,15 +19,14 @@
  * instructive reason (that is the steer); re-issuing the exact same blocked
  * call aborts the turn.
  *
- * On a detected loop the guard also *reduces reasoning effort* for the single
- * corrective turn (via `pi.setThinkingLevel`), since repetition collapses breed in
- * reasoning output — a less-reasoning turn is cheaper and less loop-prone. The
- * reduction is bound to exactly that one auto-resume turn: armed on detection,
- * applied on its `turn_start`, and undone on its `turn_end`, so it never bleeds
- * into the autonomous turns that follow. A genuine user prompt is a final safety
- * net that clears an arm/undo that never completed. Disable with
- * `PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE=1`; set the target level with
- * `PI_ANTI_LOOP_THINK_ON_LOOP` (default `off`).
+ * On a detected loop the guard also *reduces reasoning* for the single corrective
+ * request that follows, since repetition collapses breed in reasoning output — a
+ * request that reasons nothing is cheaper and far less likely to re-collapse. It
+ * rewrites that one request's outgoing provider payload on `before_provider_request`
+ * (pi's `setThinkingLevel` can't affect an in-progress run — the loop caches the
+ * level at run start), so exactly the corrective request is touched and nothing
+ * bleeds into the turns that follow. Disable with PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE=1;
+ * the target level is PI_ANTI_LOOP_THINK_ON_LOOP (default `off`).
  *
  * Counters reset on every user prompt, so a task legitimately repeated later
  * in the session is never a false positive. Disable with PI_ANTI_LOOP_DISABLE=1.
@@ -46,6 +45,7 @@ import {
   type MessageEndEventLite,
   type MessageStartEventLite,
   type MessageUpdateEventLite,
+  type ProviderRequest,
   type ToolCallEventLite,
   type ToolResultEventLite,
 } from "./controller.ts";
@@ -65,9 +65,8 @@ export interface PiLike {
     content: { customType?: string; content?: string; display?: boolean },
     options?: { deliverAs?: "steer" | "followUp" | "nextTurn"; triggerTurn?: boolean },
   ): void;
-  /** Thinking controls live on pi's ExtensionAPI (structural subset). */
+  /** Only the getter is used — the setter can't influence an in-progress run. */
   getThinkingLevel?(): string;
-  setThinkingLevel?(level: string): void;
 }
 
 /** Injected on the first loop detection — steer the agent back on track. */
@@ -87,9 +86,9 @@ interface InputEventLite {
   type?: string;
 }
 
-/** Only the turn lifecycle matters; the turn index/timestamp payload is ignored. */
-interface TurnEventLite {
-  turnIndex?: number;
+/** The provider-request hook only needs the outgoing request payload. */
+interface PayloadEventLite {
+  payload?: ProviderRequest;
 }
 
 export default function (pi: PiLike): void {
@@ -97,17 +96,20 @@ export default function (pi: PiLike): void {
 
   let controller: AntiLoopController = createController(readOptions());
 
-  // On a detected loop, temporarily drop reasoning effort: the corrective turn
-  // that reasons less is both cheaper and far less prone to the repetition
-  // collapse (which lives in reasoning output). The original level is restored
-  // on the next genuine user prompt. Disabled with PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE=1;
-  // the target level is PI_ANTI_LOOP_THINK_ON_LOOP (default "off").
+  // On a detected loop we reduce reasoning for the ONE corrective request that
+  // follows, by rewriting its outgoing provider payload (see ThinkingGovernor —
+  // pi.setThinkingLevel can't affect an in-progress run). Cheaper and far less
+  // prone to re-collapsing, since the collapse lives in reasoning output.
+  // Disable with PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE=1; the target level is
+  // PI_ANTI_LOOP_THINK_ON_LOOP (default "off"); the wire value for "off" is
+  // PI_ANTI_LOOP_THINK_OFF_WIRE (default "none", the value this model family honours).
   const VALID_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
   const rawTarget = (process.env.PI_ANTI_LOOP_THINK_ON_LOOP ?? "off").trim().toLowerCase();
   const thinking = createThinkingGovernor({
     enabled: process.env.PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE !== "1",
     target: VALID_LEVELS.has(rawTarget) ? rawTarget : "off",
     alreadyLow: new Set(["off", "minimal"]),
+    offWireValue: (process.env.PI_ANTI_LOOP_THINK_OFF_WIRE ?? "none").trim(),
   });
 
   pi.on("session_start", () => {
@@ -127,14 +129,17 @@ export default function (pi: PiLike): void {
   // It is also where we undo a thinking reduction left over from a prior loop.
   pi.on("input", (_e: InputEventLite, ctx: CtxLite) => {
     controller.resetPromptBudget();
-    thinking.onPrompt(pi, ctx?.ui);
+    thinking.onPrompt(ctx?.ui); // clear an arm whose corrective request never came
   });
 
-  // The thinking reduction is bound to exactly the one corrective turn: applied
-  // when that turn starts, undone the instant it ends, so it never bleeds into
-  // the autonomous turns that follow within the same agent run.
-  pi.on("turn_start", (_e: TurnEventLite) => thinking.onTurnStart(pi));
-  pi.on("turn_end", (_e: TurnEventLite, ctx: CtxLite) => thinking.onTurnEnd(pi, ctx?.ui));
+  // The reduction is applied here, one-shot, on the actual outgoing request of
+  // the corrective turn — the only point in the lifecycle that reliably sees it
+  // (config.reasoning is cached at run start, so the turn boundary is too late).
+  // pi hands this hook an untyped payload; the governor copies it forward
+  // untouched except for the reasoning fields (index is the I/O boundary).
+  pi.on("before_provider_request", (event: PayloadEventLite) =>
+    thinking.beforeRequest(event.payload),
+  );
 
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
     // The pi event delivers untyped tool arguments; decode them into the
@@ -166,7 +171,6 @@ export default function (pi: PiLike): void {
       event.message.content as MessageContent,
     );
     if (outcome === null) return;
-    thinking.onLoop(pi, ctx.ui);
 
     if (outcome.action === "steer") {
       ctx.ui.notify(`Anti-doom-loop: ${outcome.reason}`, "warning");
@@ -180,6 +184,7 @@ export default function (pi: PiLike): void {
     ctx.ui.notify(`Anti-doom-loop: ${outcome.reason}`, "error");
     ctx.abort();
     if (outcome.resume) {
+      thinking.onLoop(pi, ctx.ui); // reduce reasoning for the corrective request we're queuing
       pi.sendMessage?.(
         { customType: "anti-doom-loop", content: RESUME_TEXT, display: true },
         { deliverAs: "followUp", triggerTurn: true },
@@ -205,19 +210,12 @@ export default function (pi: PiLike): void {
     if (deltaType === null) return; // toolcall_delta etc. is not generated prose
     const outcome = controller.onMessageUpdate("assistant", deltaType, ae.delta ?? "");
     if (outcome === null) return;
-    thinking.onLoop(pi, ctx.ui);
-
-    if (outcome.action === "steer") {
-      ctx.ui?.notify?.(`Anti-doom-loop: ${outcome.reason}`, "warning");
-      pi.sendMessage?.(
-        { customType: "anti-doom-loop", content: STEER_TEXT, display: true },
-        { deliverAs: "steer", triggerTurn: true },
-      );
-      return;
-    }
+    // Mid-stream returns only "abort": a live repetition can't be steered out
+    // (a steer message would only be seen once this never-ending turn ended).
     ctx.ui?.notify?.(`Anti-doom-loop: ${outcome.reason}`, "error");
     ctx.abort();
     if (outcome.resume) {
+      thinking.onLoop(pi, ctx.ui); // reduce reasoning for the corrective request we're queuing
       pi.sendMessage?.(
         { customType: "anti-doom-loop", content: RESUME_TEXT, display: true },
         { deliverAs: "followUp", triggerTurn: true },

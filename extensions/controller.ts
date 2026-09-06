@@ -43,11 +43,12 @@ export interface CtxLite {
   abort(): void;
 }
 
-/** The thinking knobs the governor uses; these live on pi's ExtensionAPI (the
- * `pi` object), not on the event ctx, so this is a structural subset of that. */
+/** A structural subset of pi's ExtensionAPI used only to *read* the current
+ * level. The getter is reliable even mid-run; the setter is NOT (the running
+ * loop caches config.reasoning at run start), so we never call it — see
+ * createThinkingGovernor. */
 export interface ThinkingApiLite {
   getThinkingLevel?(): string;
-  setThinkingLevel?(level: string): void;
 }
 
 export interface ThinkingNotifyLite {
@@ -57,93 +58,112 @@ export interface ThinkingNotifyLite {
 export interface ThinkingGovernorOptions {
   /** Feature switch; when false the governor is inert. */
   enabled: boolean;
-  /** Level to drop to while a loop is being broken (clamped to the model). */
+  /** Level to drop to for the corrective request: "off" | "low" | "minimal" | … */
   target: string;
   /** Levels already low enough that reducing is pointless (e.g. off/minimal). */
   alreadyLow: ReadonlySet<string>;
+  /** The wire value that means "reasoning off" for this model family (default "none"). */
+  offWireValue: string;
 }
 
 /**
- * Decides when to temporarily reduce the agent's reasoning effort on a detected
- * loop. Reasoning output is the usual breeding ground for repetition collapses,
- * so the single corrective turn that reasons less is both cheaper and less
- * loop-prone. The reduction is bound to exactly ONE turn — the auto-resume
- * corrective reply — via pi's per-turn lifecycle: armed when a loop is detected,
- * applied on that turn's `turn_start`, and undone on its `turn_end`. It never
- * bleeds into the autonomous turns that follow. A genuine user prompt is a final
- * safety net that clears an arm that never reached a turn. Pure and pi-free
- * (driven with a fake api in tests); `index.ts` wires it to pi's event loop.
+ * Reduces reasoning for the SINGLE corrective request that follows a loop
+ * detection. Reasoning output is where repetition collapses breed, so the
+ * fresh-approach turn that reasons nothing is both cheaper and far less likely
+ * to re-collapse.
+ *
+ * Why not `pi.setThinkingLevel`? The low-level loop snapshots `config.reasoning`
+ * from the session level ONCE at run start (pi-agent-core/agent.js) and reuses it
+ * for every turn in that run; the auto-resume turn is drained inside the same
+ * loop, so it keeps the stale level and a mid-run set is ignored (it only takes
+ * effect on the NEXT prompt — by which time we've already undone it). It also
+ * pollutes the session's default thinking level. So instead we arm here and
+ * rewrite the ACTUAL outgoing provider payload on `before_provider_request`,
+ * one-shot: exactly the corrective request is affected, the session level is
+ * never touched, and there is nothing to restore.
+ *
+ * Pure and pi-free (driven with a fake api + payload object in tests); `index.ts`
+ * wires `beforeRequest` to pi's `before_provider_request` event.
  */
 export interface ThinkingGovernor {
-  /** Arm a reduction for the *next* (corrective) turn. Called on any loop signal. */
+  /** Arm a one-shot reduction for the next (corrective) request. On any loop signal. */
   onLoop(api: ThinkingApiLite, ui?: ThinkingNotifyLite): void;
-  /** Apply the armed level on a `turn_start` (the corrective turn). */
-  onTurnStart(api: ThinkingApiLite): void;
-  /** Undo the level on that turn's `turn_end` — restoring immediately. */
-  onTurnEnd(api: ThinkingApiLite, ui?: ThinkingNotifyLite): void;
-  /** Safety net on a fresh user prompt: clear a stale arm / undo a lingering drop. */
-  onPrompt(api: ThinkingApiLite, ui?: ThinkingNotifyLite): void;
+  /** Consume the arm: rewrite the corrective request body, else leave it alone. */
+  beforeRequest(payload: ProviderRequest | undefined): ProviderRequest | undefined;
+  /** Safety net on a fresh user prompt: drop an arm that never reached a request. */
+  onPrompt(ui?: ThinkingNotifyLite): void;
   /** Forget all pending state (session start / manual reset). */
   onSessionStart(): void;
-  /** True while the reduced level is actively applied (between start and end). */
-  isLowered(): boolean;
-  /** True while a reduction is armed awaiting the next turn. */
+  /** True while a reduction is armed awaiting its corrective request. */
   isArmed(): boolean;
 }
 
 export function createThinkingGovernor(o: ThinkingGovernorOptions): ThinkingGovernor {
-  // Arm: the original level, waiting to be applied on the next turn_start.
-  let pendingFrom: string | undefined;
-  // Active: the original level, remembered while the reduced level is applied,
-  // until the corrective turn's turn_end restores it.
-  let loweredFrom: string | undefined;
+  let armed = false;
   return {
     onLoop(api, ui) {
-      if (!o.enabled) return;
-      if (pendingFrom !== undefined || loweredFrom !== undefined) return; // one episode
+      if (!o.enabled || armed) return; // inert / already armed for this episode
       const cur = api.getThinkingLevel?.();
       if (!cur || cur === o.target || o.alreadyLow.has(cur)) return; // nothing to gain
-      pendingFrom = cur;
-      ui?.notify(
-        `Anti-doom-loop: will lower thinking ${cur} → ${o.target} for the corrective turn`,
-        "info",
-      );
+      armed = true;
+      ui?.notify(`Anti-doom-loop: will disable reasoning on the corrective turn (was ${cur})`, "info");
     },
-    onTurnStart(api) {
-      if (pendingFrom === undefined) return; // not a corrective turn we armed
-      loweredFrom = pendingFrom;
-      pendingFrom = undefined;
-      api.setThinkingLevel?.(o.target);
+    beforeRequest(payload) {
+      if (!armed || !payload) return undefined; // not our corrective request -> don't touch it
+      armed = false; // one-shot: only the very next (corrective) request
+      return withReducedThinking(payload, o);
     },
-    onTurnEnd(api, ui) {
-      if (loweredFrom === undefined) return; // a normal turn, nothing to undo
-      const restore = loweredFrom;
-      loweredFrom = undefined;
-      api.setThinkingLevel?.(restore);
-      ui?.notify(`Anti-doom-loop: restored thinking to ${restore}`, "info");
-    },
-    onPrompt(api, ui) {
-      pendingFrom = undefined; // arm that never reached a turn → drop it
-      if (loweredFrom !== undefined) {
-        // pathological: corrective turn_end never fired → don't leave it stuck
-        const restore = loweredFrom;
-        loweredFrom = undefined;
-        api.setThinkingLevel?.(restore);
-        ui?.notify(`Anti-doom-loop: restored thinking to ${restore}`, "info");
-      }
+    onPrompt(ui) {
+      if (!armed) return;
+      armed = false; // the corrective request never came (run stalled) -> don't leak
+      ui?.notify("Anti-doom-loop: dropped a pending reasoning reduction", "info");
     },
     onSessionStart() {
-      pendingFrom = undefined;
-      loweredFrom = undefined;
-    },
-    isLowered() {
-      return loweredFrom !== undefined;
+      armed = false;
     },
     isArmed() {
-      return pendingFrom !== undefined;
+      return armed;
     },
   };
 }
+
+/**
+ * The subset of an outgoing provider request body the governor understands.
+ * pi hands `before_provider_request` an untyped payload; index.ts decodes it
+ * into this domain type at the event boundary (only the reasoning fields are
+ * read — everything else stays untouched on the object we copy-forward).
+ */
+export interface ProviderRequest {
+  reasoning_effort?: string;
+  enable_thinking?: boolean;
+  thinking?: { type?: string };
+  chat_template_kwargs?: { enable_thinking?: boolean };
+}
+
+/**
+ * Return a copy of an openai-completions-style request body rewritten to reason
+ * at `target` effort (or not at all when target is "off"). We mutate the real
+ * payload because the loop's cached config.reasoning can't be changed mid-run.
+ * Setting several provider-specific off fields is harmless: a provider ignores
+ * fields it does not read, and this reliably disables reasoning on the
+ * openai-completions / qwen / vLLM family the guard targets.
+ */
+export function withReducedThinking(payload: ProviderRequest, o: ThinkingGovernorOptions): ProviderRequest {
+  const p: ProviderRequest = Object.assign({}, payload);
+  const off = o.target === "off";
+  p.reasoning_effort = off ? o.offWireValue : o.target; // openai-completions / vLLM (the field this model honours)
+  if (p.thinking) {
+    p.thinking = { type: off ? "disabled" : "enabled" }; // deepseek-style
+  }
+  if (off) {
+    p.enable_thinking = false; // qwen thinkingFormat:"qwen"
+    if (p.chat_template_kwargs) {
+      p.chat_template_kwargs = Object.assign({}, p.chat_template_kwargs, { enable_thinking: false });
+    }
+  }
+  return p;
+}
+
 export interface CommandCtxLite {
   ui: { notify(message: string, level: string): void };
 }
@@ -174,8 +194,12 @@ export interface TextLoopOutcome {
   resume: boolean;
 }
 
-/** Auto-resumes allowed per user prompt before we hand control back for real. */
-export const RESUME_BUDGET = 1;
+/**
+ * Auto-resumes allowed per user prompt before we hand control back for real.
+ * Two: one to recover the initial collapse, one more for the corrective turn if
+ * IT re-collapses. Still bounded so a truly stuck model can't cycle forever.
+ */
+export const RESUME_BUDGET = 2;
 
 /** Re-evaluate the mid-stream guard only every this many new chars (cheap throttle). */
 export const STREAM_CHECK_STRIDE = 256;
@@ -313,18 +337,20 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
         ? `assistant turn is stuck repeating "${truncate(det.sample, 24)}" (${det.periodLength}-char unit) ~${det.repeats} times`
         : `assistant turn ran to ${streamTotal} chars of generated text without stopping`;
 
-      // Same escalation ladder as the message-loop path (shared lifetime counters).
-      if (!streamSteered) {
-        streamSteered = true;
-        steers++;
-        return { reason, action: "steer", resume: false };
-      }
+      // A live mid-stream repetition can't be steered out — a steer message
+      // would only be observed once this never-ending turn ended, which defeats
+      // the point — so abort in ONE shot. `streamSteered` is the single-shot
+      // gate: a sustained burst of the same collapse consumes exactly ONE
+      // resume (previously it charged both a steer and an abort, burning the
+      // budget before the corrective turn even ran, which stalled on the very
+      // next detection). The next assistant turn starts with a fresh chance.
+      if (streamSteered) return null; // already aborted this turn
+      streamSteered = true;
+      aborts++;
       if (resumes < RESUME_BUDGET) {
         resumes++;
-        aborts++;
         return { reason, action: "abort", resume: true };
       }
-      aborts++;
       return { reason, action: "abort", resume: false };
     },
 

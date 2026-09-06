@@ -2,6 +2,31 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.1.3] — Carbyne fork
+
+### Fixed
+
+- **A second consecutive collapse no longer looks "stuck".** The auto-resume budget was
+  `1`, so the first collapse got a fresh-resume but a second collapse (the corrective turn
+  spinning again — common when the same low-effort model re-collapses) aborted with **no**
+  resume: the run halted with nothing re-prompting it. `RESUME_BUDGET` is now `2` — one spin
+  on the fresh attempt still recovers, and only a second failure on top of that hands control
+  back to the user. A genuine user prompt re-arms the budget to `2`.
+- **The thinking reduction now actually lands on the corrective turn** (0.1.2 did not). The
+  low-level agent loop snapshots `config.reasoning` from the session level **once at run
+  start** and the auto-resume turn is drained inside that same run, so `pi.setThinkingLevel`
+  was structurally ignored (and leaked the reduced level onto the session default). The
+  governor instead arms on detection and rewrites the **actual outgoing provider payload** on
+  the `before_provider_request` hook — one-shot, so exactly the corrective request is reduced
+  (`reasoning_effort: "none"` + `enable_thinking: false` + deepseek `thinking.type`), the
+  session level is never touched, and there is nothing to restore. New
+  `PI_ANTI_LOOP_THINK_OFF_WIRE` tunes the off wire value (default `none`, the vLLM spelling).
+- **A sustained mid-stream burst charges one resume, not two.** The `message_update` guard
+  previously steered-then-aborted; because that path only fires for a sustained collapse, the
+  steer was a wasted round-trip and the same-turn continuation drew a second budget. It now
+  **aborts in one shot** and queues a single fresh-resume (a single-shot gate stops any
+  further same-turn charges).
+
 ## [0.1.2] — Carbyne fork
 
 ### Added

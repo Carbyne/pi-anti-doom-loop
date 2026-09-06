@@ -18,129 +18,135 @@ import {
   type LoopOptions,
 } from "../extensions/detector.ts";
 import { createController } from "../extensions/controller.ts";
-import { createThinkingGovernor } from "../extensions/controller.ts";
+import { createThinkingGovernor, withReducedThinking } from "../extensions/controller.ts";
 
-/** A fake pi thinking api that records the last set value + current level. */
-function fakeThinking(start: string) {
-  const calls: string[] = [];
-  return {
-    calls,
-    current: () => (calls.length ? calls[calls.length - 1]! : start),
-    getThinkingLevel: () => (calls.length ? calls[calls.length - 1]! : start),
-    setThinkingLevel: (level: string) => {
-      calls.push(level);
-    },
-  };
+/** Fake pi api exposing only the current thinking level (the getter). */
+function fakeApi(level: string | undefined) {
+  return { getThinkingLevel: () => level as string };
 }
 
-describe("thinking governor (turn-scoped: arm on loop, apply on turn start, undo on turn end)", () => {
-  const GOV = {
-    enabled: true,
-    target: "off",
-    alreadyLow: new Set(["off", "minimal"]),
-  };
+const GOV = {
+  enabled: true,
+  target: "off",
+  alreadyLow: new Set(["off", "minimal"]),
+  offWireValue: "none",
+};
 
-  it("arms on loop without lowering, applies on the corrective turn start", () => {
+/** Concrete shape of an outgoing provider request used in these assertions. */
+type Req = {
+  reasoning_effort?: string;
+  enable_thinking?: boolean;
+  messages?: unknown[];
+  thinking?: { type: string };
+  chat_template_kwargs?: { enable_thinking: boolean };
+  model?: string;
+};
+
+describe("thinking governor (arm on loop, rewrite the corrective request once)", () => {
+  it("arms on loop and rewrites the very next request to off, then stops", () => {
     const g = createThinkingGovernor(GOV);
-    const api = fakeThinking("high");
-    g.onLoop(api);
-    assert.equal(api.calls.length, 0); // not lowered yet — only armed
+    // not armed yet → the request is left completely alone
+    assert.equal(g.beforeRequest({ reasoning_effort: "medium" }), undefined);
+    g.onLoop(fakeApi("medium"));
     assert.ok(g.isArmed());
-    assert.ok(!g.isLowered());
-    g.onTurnStart(api);
-    assert.equal(api.calls[api.calls.length - 1], "off"); // applied for this turn
-    assert.ok(g.isLowered());
-    assert.ok(!g.isArmed());
+    const req = { reasoning_effort: "medium", messages: [] };
+    const out = g.beforeRequest(req) as Req;
+    assert.equal(out.reasoning_effort, "none");
+    assert.equal(out.enable_thinking, false);
+    assert.deepEqual(out.messages, []); // everything else preserved
+    assert.ok(!g.isArmed()); // consumed
+    assert.equal(g.beforeRequest({ reasoning_effort: "medium" }), undefined); // one-shot
   });
 
-  it("restores on that turn's end and never bleeds into the next turn", () => {
-    const g = createThinkingGovernor(GOV);
-    const api = fakeThinking("high");
-    g.onLoop(api);
-    g.onTurnStart(api);
-    assert.equal(api.calls[api.calls.length - 1], "off");
-    g.onTurnEnd(api); // the corrective turn finishes → restore immediately
-    assert.equal(api.calls[api.calls.length - 1], "high");
-    assert.ok(!g.isLowered());
-    // a following autonomous turn stays at the model's real level
-    g.onTurnStart(api);
-    g.onTurnEnd(api);
-    assert.equal(api.calls.length, 2); // only the arm→(off,high) pair so far
-    assert.equal(api.calls[api.calls.length - 1], "high");
-  });
-
-  it("does nothing when already low enough (off/minimal)", () => {
-    for (const lvl of ["off", "minimal"]) {
+  it("does not arm when already low enough (off/minimal/absent)", () => {
+    for (const lvl of ["off", "minimal", undefined]) {
       const g = createThinkingGovernor(GOV);
-      const api = fakeThinking(lvl);
-      g.onLoop(api);
-      g.onTurnStart(api);
-      assert.equal(api.calls.length, 0);
-      assert.ok(!g.isLowered() && !g.isArmed());
+      g.onLoop(fakeApi(lvl));
+      assert.ok(!g.isArmed());
+      assert.equal(g.beforeRequest({ reasoning_effort: "medium" }), undefined);
     }
   });
 
-  it("does not arm when current already equals target", () => {
+  it("does not arm when current already equals the target", () => {
     const g = createThinkingGovernor(GOV);
-    const api = fakeThinking("off");
-    g.onLoop(api);
+    g.onLoop(fakeApi("off"));
     assert.ok(!g.isArmed());
-    g.onTurnStart(api);
-    assert.equal(api.calls.length, 0);
   });
 
   it("is inert when disabled", () => {
     const g = createThinkingGovernor({ ...GOV, enabled: false });
-    const api = fakeThinking("high");
-    g.onLoop(api);
-    g.onTurnStart(api);
-    g.onTurnEnd(api);
-    assert.equal(api.calls.length, 0);
+    g.onLoop(fakeApi("medium"));
+    assert.ok(!g.isArmed());
+    assert.equal(g.beforeRequest({ reasoning_effort: "medium" }), undefined);
   });
 
-  it("arms only once per episode (no re-arm while armed or lowered)", () => {
+  it("arms once: repeated onLoop while armed stays a single one-shot rewrite", () => {
     const g = createThinkingGovernor(GOV);
-    const api = fakeThinking("medium");
-    g.onLoop(api);
-    g.onLoop(api); // ignored: already armed
-    g.onTurnStart(api);
-    g.onLoop(api); // ignored: already lowered for this turn
-    g.onTurnEnd(api);
-    // exactly the applied pair: off then restore high
-    assert.deepEqual(api.calls, ["off", "medium"]);
+    g.onLoop(fakeApi("medium"));
+    g.onLoop(fakeApi("medium")); // already armed → ignored
+    const out = g.beforeRequest({}) as Req;
+    assert.equal(out.reasoning_effort, "none");
+    assert.ok(!g.isArmed());
   });
 
-  it("onPrompt clears a stale arm that never reached a turn (no lowering)", () => {
+  it("onPrompt drops a stale arm so no later request is reduced", () => {
     const g = createThinkingGovernor(GOV);
-    const api = fakeThinking("high");
-    g.onLoop(api); // armed
-    g.onPrompt(api); // the corrective turn never started
-    assert.ok(!g.isArmed() && !g.isLowered());
-    assert.equal(api.calls.length, 0); // never lowered, so nothing to restore
+    g.onLoop(fakeApi("medium"));
+    assert.ok(g.isArmed());
+    g.onPrompt(); // corrective request never came (run stalled)
+    assert.ok(!g.isArmed());
+    assert.equal(g.beforeRequest({ reasoning_effort: "medium" }), undefined);
   });
 
-  it("onPrompt safety-restores a lingering drop whose turn_end never fired", () => {
+  it("onSessionStart clears an arm", () => {
     const g = createThinkingGovernor(GOV);
-    const api = fakeThinking("high");
-    g.onLoop(api);
-    g.onTurnStart(api); // lowered, but its turn_end is lost
-    assert.ok(g.isLowered());
-    g.onPrompt(api); // safety net
-    assert.equal(api.calls[api.calls.length - 1], "high");
-    assert.ok(!g.isLowered());
-  });
-
-  it("onSessionStart clears armed + lowered without emitting a restore", () => {
-    const g = createThinkingGovernor(GOV);
-    const api = fakeThinking("high");
-    g.onLoop(api);
-    g.onTurnStart(api);
-    assert.ok(g.isLowered());
+    g.onLoop(fakeApi("medium"));
     g.onSessionStart();
-    assert.ok(!g.isLowered() && !g.isArmed());
-    const before = api.calls.length;
-    g.onTurnEnd(api);
-    assert.equal(api.calls.length, before); // no restore scheduled
+    assert.ok(!g.isArmed());
+  });
+
+  it("rewrites nested thinking/chat_template_kwargs off, without mutating the original", () => {
+    const g = createThinkingGovernor(GOV);
+    g.onLoop(fakeApi("high"));
+    const orig = {
+      reasoning_effort: "high",
+      thinking: { type: "enabled" },
+      chat_template_kwargs: { enable_thinking: true },
+      model: "x",
+    };
+    const out = g.beforeRequest(orig) as Req;
+    assert.equal(out.reasoning_effort, "none");
+    assert.deepEqual(out.thinking, { type: "disabled" });
+    assert.equal(out.chat_template_kwargs?.enable_thinking, false);
+    assert.equal(out.model, "x");
+    // the caller's payload object is not mutated
+    assert.equal(orig.reasoning_effort, "high");
+    assert.deepEqual(orig.thinking, { type: "enabled" });
+    assert.equal(orig.chat_template_kwargs.enable_thinking, true);
+  });
+
+  it("ignores an absent payload without consuming the arm", () => {
+    const g = createThinkingGovernor(GOV);
+    g.onLoop(fakeApi("medium"));
+    // No payload yet (e.g. a hook fired with none): leave it alone and stay armed
+    // so the real corrective request can still be reduced.
+    assert.equal(g.beforeRequest(undefined), undefined);
+    assert.ok(g.isArmed(), "an absent payload does not consume the one-shot arm");
+    const out = g.beforeRequest({ reasoning_effort: "medium" }) as Req;
+    assert.equal(out.reasoning_effort, "none", "the next real request is still reduced");
+    assert.ok(!g.isArmed());
+  });
+});
+
+describe("withReducedThinking (lowering, not just disabling)", () => {
+  it("a non-off target maps the effort and leaves enable_thinking alone", () => {
+    const p = withReducedThinking({ reasoning_effort: "high" }, { ...GOV, target: "low" }) as Req;
+    assert.equal(p.reasoning_effort, "low");
+    assert.equal(p.enable_thinking, undefined);
+  });
+  it("a non-off target flips a deepseek-style thinking object to enabled", () => {
+    const p = withReducedThinking({ thinking: { type: "disabled" } }, { ...GOV, target: "minimal" }) as Req;
+    assert.deepEqual(p.thinking, { type: "enabled" });
   });
 });
 
@@ -682,23 +688,23 @@ describe("mid-stream abort + auto-resume budget re-arm", () => {
     return last;
   }
 
-  it("auto-resumes the first collapse, not a second in one prompt, then re-arms on user input", () => {
+  it("auto-resumes two collapses in one prompt, then stalls, then re-arms on user input", () => {
     const c = createController();
 
-    const a1 = runDoomToAbort(c);
-    assert.equal(a1?.action, "abort");
-    assert.equal(a1?.resume, true, "first collapse in a prompt auto-resumes");
+    assert.equal(runDoomToAbort(c)?.resume, true, "collapse #1 in a prompt auto-resumes");
+    assert.equal(runDoomToAbort(c)?.resume, true, "collapse #2 still within budget (2)");
+    assert.equal(
+      runDoomToAbort(c)?.resume,
+      false,
+      "budget spent → stall (no more auto-resume within the same prompt)",
+    );
 
-    // The auto-resume continuation loops again — the budget for THIS prompt is
-    // already spent, so it aborts for real and hands control back (no resume).
-    const a2 = runDoomToAbort(c);
-    assert.equal(a2?.action, "abort");
-    assert.equal(a2?.resume, false, "budget spent → no extra auto-resume within the same prompt");
-
-    // The user types "continue": the input event re-arms the single auto-resume.
+    // The user types "continue": the input event re-arms the (2-resume) budget.
     c.resetPromptBudget();
-    const a3 = runDoomToAbort(c);
-    assert.equal(a3?.action, "abort");
-    assert.equal(a3?.resume, true, "a genuine new user prompt re-arms the auto-resume");
+    assert.equal(
+      runDoomToAbort(c)?.resume,
+      true,
+      "a genuine new user prompt re-arms the auto-resume",
+    );
   });
 });

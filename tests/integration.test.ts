@@ -35,6 +35,7 @@ function makeFakePi() {
     sendMessage(content, options) {
       sent.push({ content, options });
     },
+    getThinkingLevel: () => "medium",
   };
   return {
     pi,
@@ -144,7 +145,7 @@ describe("controller: message lifecycle", () => {
 });
 
 describe("controller: steer → abort → bounded resume", () => {
-  it("first detection steers, second aborts with resume, third aborts for real", () => {
+  it("steers once, then aborts with a resume twice (budget), then for real", () => {
     const c = createController(pinned);
     const msg = (t: string) => [{ type: "text", text: t }];
     const loop = "Let me fetch the merge ref:";
@@ -158,13 +159,9 @@ describe("controller: steer → abort → bounded resume", () => {
     assert.equal(steer?.resume, false);
     assert.match(steer?.reason ?? "", /identical text 3 times within the last/);
 
-    const abort1 = fire();
-    assert.equal(abort1?.action, "abort");
-    assert.equal(abort1?.resume, true, "first abort queues a resume");
-
-    const abort2 = fire();
-    assert.equal(abort2?.action, "abort");
-    assert.equal(abort2?.resume, false, "resume budget spent");
+    assert.equal(fire()?.resume, true, "abort #1 queues a resume");
+    assert.equal(fire()?.resume, true, "abort #2 still has budget (RESUME_BUDGET=2)");
+    assert.equal(fire()?.resume, false, "resume budget spent");
   });
 
   it("reset clears the steer flag but keeps the resume budget (session-scoped)", () => {
@@ -173,13 +170,14 @@ describe("controller: steer → abort → bounded resume", () => {
     const loop = "Let me fetch the merge ref:";
     const fire = () => c.onMessageEnd("assistant", msg(loop));
 
-    // consume the budget
+    // consume the whole (2-resume) budget: a steer then two resumed aborts
     fire();
     fire();
     fire(); // steer
-    fire(); // abort + resume (budget now spent)
+    fire(); // abort + resume (1)
+    fire(); // abort + resume (2) → budget spent
 
-    c.reset(); // new user prompt — steer flag cleared, budget kept
+    c.reset(); // new user prompt — steer flag cleared, budget kept spent
 
     fire();
     fire();
@@ -187,7 +185,7 @@ describe("controller: steer → abort → bounded resume", () => {
     assert.equal(steerAgain?.action, "steer", "reset re-arms the steer flag");
     const abortAgain = fire();
     assert.equal(abortAgain?.action, "abort");
-    assert.equal(abortAgain?.resume, false, "budget not restored by reset");
+    assert.equal(abortAgain?.resume, false, "budget not restored by reset()");
   });
 });
 
@@ -332,14 +330,19 @@ describe("index.ts adapter (fake PiLike)", () => {
       assert.equal(sent[0].options?.deliverAs, "steer");
       assert.equal(sent[0].options?.triggerTurn, true);
 
-      fireMsg(); // streak 4 — ABORT + resume
+      fireMsg(); // streak 4 — ABORT + resume (1)
       assert.equal(aborts.length, 1, "persistent loop aborts");
       assert.equal(sent.length, 2, "a resume directive is queued after the abort");
       assert.equal(sent[1].options?.deliverAs, "followUp");
 
-      fireMsg(); // streak 5 — abort for real (resume budget spent)
-      assert.equal(aborts.length, 2, "looping after resume aborts again");
-      assert.equal(sent.length, 2, "no second resume — budget is bounded");
+      fireMsg(); // streak 5 — ABORT + resume (2): the corrective turn re-collapsed
+      assert.equal(aborts.length, 2, "looping again aborts again");
+      assert.equal(sent.length, 3, "budget=2 → a second resume is allowed");
+      assert.equal(sent[2].options?.deliverAs, "followUp");
+
+      fireMsg(); // streak 6 — abort for real (resume budget spent)
+      assert.equal(aborts.length, 3, "still looping aborts again");
+      assert.equal(sent.length, 3, "no third resume — the budget is bounded");
     } finally {
       if (prev === undefined) delete process.env.PI_ANTI_LOOP_TEXT_REPEATS;
       else process.env.PI_ANTI_LOOP_TEXT_REPEATS = prev;
@@ -387,14 +390,15 @@ describe("index.ts adapter (fake PiLike)", () => {
 
 describe("controller: mid-stream intra-turn guard", () => {
   const stream = { ...DEFAULT_OPTIONS };
-  it("steers on a duct collapse, aborts if it continues", () => {
+  it("aborts a duct collapse in one shot (a sustained burst is a single abort)", () => {
     const c = createController(stream);
     c.onMessageStart();
     const duct = "duct".repeat(300);
     const o = c.onMessageUpdate("assistant", "text", duct);
-    assert.ok(o && o.action === "steer", "first hit steers");
+    assert.ok(o && o.action === "abort", "first hit aborts immediately (no steer)");
+    assert.ok(o && o.resume === true, "first abort queues a resume");
     const o2 = c.onMessageUpdate("assistant", "text", duct);
-    assert.ok(o2 && o2.action === "abort", "still looping aborts");
+    assert.equal(o2, null, "sustained same-turn burst is single-shot (not double-charged)");
   });
   it("ignores non-text deltas and non-assistant roles", () => {
     const c = createController(stream);
@@ -414,20 +418,20 @@ describe("controller: mid-stream intra-turn guard", () => {
     c.onMessageStart();
     assert.equal(c.onMessageUpdate("assistant", "text", "duct".repeat(400)), null);
   });
-  it("aborts an over-char-cap turn after one steer", () => {
+  it("aborts an over-char-cap turn in one shot", () => {
     const c = createController({ ...DEFAULT_OPTIONS, streamMaxTurnChars: 1000 });
     c.onMessageStart();
     let prose = "";
     for (let i = 0; i < 400; i++) prose += `w${i} `;
     const o = c.onMessageUpdate("assistant", "text", prose);
-    assert.ok(o && o.action === "steer", "over-cap steers first");
-    const o2 = c.onMessageUpdate("assistant", "text", prose);
-    assert.ok(o2 && o2.action === "abort", "over-cap after steer aborts");
+    assert.ok(o && o.action === "abort", "over-cap aborts immediately");
+    assert.ok(o && o.resume === true, "queues a resume");
+    assert.equal(c.onMessageUpdate("assistant", "text", prose), null, "single-shot");
   });
 });
 
 describe("index adapter: message_update mid-stream guard", () => {
-  it("steers then aborts a streamed duct loop through the real wiring", () => {
+  it("aborts a streamed duct loop and queus a fresh-approach resume", () => {
     const { pi, fire, sent } = makeFakePi();
     indexDefault(pi);
     let aborts = 0;
@@ -440,11 +444,38 @@ describe("index adapter: message_update mid-stream guard", () => {
     fire("message_start", { message: { role: "assistant" } }, ctx);
     const duct = "duct".repeat(300);
     fire("message_update", { assistantMessageEvent: { type: "text_delta", delta: duct } }, ctx);
-    assert.equal(aborts, 0, "first hit steers, no abort");
-    assert.equal(sent.length, 1);
-    assert.equal(sent[0].options?.deliverAs, "steer");
+    assert.equal(aborts, 1, "first hit aborts immediately");
+    assert.equal(sent.length, 1, "a fresh-approach resume was queud");
+    assert.equal(sent[0].options?.deliverAs, "followUp");
     fire("message_update", { assistantMessageEvent: { type: "text_delta", delta: duct } }, ctx);
-    assert.equal(aborts, 1, "continued loop aborts");
+    assert.equal(aborts, 1, "sustained burst is single-shot (not double-charged)");
+  });
+  it("reduces reasoning on the corrective request after a mid-stream abort + resume", () => {
+    const { pi, fire } = makeFakePi();
+    indexDefault(pi);
+    const ctx = {
+      ...fakeCtx(),
+      abort: () => {},
+    };
+    fire("message_start", { message: { role: "assistant" } }, ctx);
+    fire(
+      "message_update",
+      { assistantMessageEvent: { type: "text_delta", delta: "duct".repeat(300) } },
+      ctx,
+    ); // aborts + arms the reduction for the corrective request
+    const out = fire(
+      "before_provider_request",
+      { payload: { reasoning_effort: "medium" } },
+      ctx,
+    ) as { reasoning_effort?: string; enable_thinking?: boolean } | undefined;
+    assert.ok(out, "the corrective request payload was rewritten");
+    assert.equal(out?.reasoning_effort, "none");
+    assert.equal(out?.enable_thinking, false);
+    // one-shot: the very next request is left alone again
+    assert.equal(
+      fire("before_provider_request", { payload: { reasoning_effort: "high" } }, ctx),
+      undefined,
+    );
   });
   it("never scans toolcall_delta (a big file write is not a loop)", () => {
     const { pi, fire, sent } = makeFakePi();
