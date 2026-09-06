@@ -66,45 +66,81 @@ export interface ThinkingGovernorOptions {
 /**
  * Decides when to temporarily reduce the agent's reasoning effort on a detected
  * loop. Reasoning output is the usual breeding ground for repetition collapses,
- * so a corrective turn that reasons less is both cheaper and less loop-prone.
- * The original level is remembered and restored on the next genuine user prompt,
- * so this is scoped to the stuck episode and never silently sticks. Pure and
- * pi-free (driven with a fake api in tests); `index.ts` wires it to pi.
+ * so the single corrective turn that reasons less is both cheaper and less
+ * loop-prone. The reduction is bound to exactly ONE turn — the auto-resume
+ * corrective reply — via pi's per-turn lifecycle: armed when a loop is detected,
+ * applied on that turn's `turn_start`, and undone on its `turn_end`. It never
+ * bleeds into the autonomous turns that follow. A genuine user prompt is a final
+ * safety net that clears an arm that never reached a turn. Pure and pi-free
+ * (driven with a fake api in tests); `index.ts` wires it to pi's event loop.
  */
 export interface ThinkingGovernor {
-  /** Called whenever a loop is detected (steer or abort path). */
+  /** Arm a reduction for the *next* (corrective) turn. Called on any loop signal. */
   onLoop(api: ThinkingApiLite, ui?: ThinkingNotifyLite): void;
-  /** Restore the remembered level on a fresh user prompt. */
+  /** Apply the armed level on a `turn_start` (the corrective turn). */
+  onTurnStart(api: ThinkingApiLite): void;
+  /** Undo the level on that turn's `turn_end` — restoring immediately. */
+  onTurnEnd(api: ThinkingApiLite, ui?: ThinkingNotifyLite): void;
+  /** Safety net on a fresh user prompt: clear a stale arm / undo a lingering drop. */
   onPrompt(api: ThinkingApiLite, ui?: ThinkingNotifyLite): void;
-  /** Forget pending state (session start / manual reset). */
+  /** Forget all pending state (session start / manual reset). */
   onSessionStart(): void;
-  /** True while a reduced level is in effect awaiting restore. */
+  /** True while the reduced level is actively applied (between start and end). */
   isLowered(): boolean;
+  /** True while a reduction is armed awaiting the next turn. */
+  isArmed(): boolean;
 }
 
 export function createThinkingGovernor(o: ThinkingGovernorOptions): ThinkingGovernor {
+  // Arm: the original level, waiting to be applied on the next turn_start.
+  let pendingFrom: string | undefined;
+  // Active: the original level, remembered while the reduced level is applied,
+  // until the corrective turn's turn_end restores it.
   let loweredFrom: string | undefined;
   return {
     onLoop(api, ui) {
-      if (!o.enabled || loweredFrom !== undefined) return; // one reduce per episode
+      if (!o.enabled) return;
+      if (pendingFrom !== undefined || loweredFrom !== undefined) return; // one episode
       const cur = api.getThinkingLevel?.();
       if (!cur || cur === o.target || o.alreadyLow.has(cur)) return; // nothing to gain
-      api.setThinkingLevel?.(o.target);
-      loweredFrom = cur;
-      ui?.notify(`Anti-doom-loop: lowered thinking ${cur} → ${o.target} to break the loop`, "info");
+      pendingFrom = cur;
+      ui?.notify(
+        `Anti-doom-loop: will lower thinking ${cur} → ${o.target} for the corrective turn`,
+        "info",
+      );
     },
-    onPrompt(api, ui) {
-      if (loweredFrom === undefined) return;
+    onTurnStart(api) {
+      if (pendingFrom === undefined) return; // not a corrective turn we armed
+      loweredFrom = pendingFrom;
+      pendingFrom = undefined;
+      api.setThinkingLevel?.(o.target);
+    },
+    onTurnEnd(api, ui) {
+      if (loweredFrom === undefined) return; // a normal turn, nothing to undo
       const restore = loweredFrom;
       loweredFrom = undefined;
       api.setThinkingLevel?.(restore);
       ui?.notify(`Anti-doom-loop: restored thinking to ${restore}`, "info");
     },
+    onPrompt(api, ui) {
+      pendingFrom = undefined; // arm that never reached a turn → drop it
+      if (loweredFrom !== undefined) {
+        // pathological: corrective turn_end never fired → don't leave it stuck
+        const restore = loweredFrom;
+        loweredFrom = undefined;
+        api.setThinkingLevel?.(restore);
+        ui?.notify(`Anti-doom-loop: restored thinking to ${restore}`, "info");
+      }
+    },
     onSessionStart() {
+      pendingFrom = undefined;
       loweredFrom = undefined;
     },
     isLowered() {
       return loweredFrom !== undefined;
+    },
+    isArmed() {
+      return pendingFrom !== undefined;
     },
   };
 }

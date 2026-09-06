@@ -33,33 +33,40 @@ function fakeThinking(start: string) {
   };
 }
 
-describe("thinking governor (reduce on loop, restore on prompt)", () => {
+describe("thinking governor (turn-scoped: arm on loop, apply on turn start, undo on turn end)", () => {
   const GOV = {
     enabled: true,
     target: "off",
     alreadyLow: new Set(["off", "minimal"]),
   };
 
-  it("drops a reasoning level to target when a loop is detected", () => {
+  it("arms on loop without lowering, applies on the corrective turn start", () => {
     const g = createThinkingGovernor(GOV);
     const api = fakeThinking("high");
     g.onLoop(api);
-    assert.equal(api.calls[0], "off");
+    assert.equal(api.calls.length, 0); // not lowered yet — only armed
+    assert.ok(g.isArmed());
+    assert.ok(!g.isLowered());
+    g.onTurnStart(api);
+    assert.equal(api.calls[api.calls.length - 1], "off"); // applied for this turn
     assert.ok(g.isLowered());
+    assert.ok(!g.isArmed());
   });
 
-  it("restores the remembered level on the next prompt", () => {
+  it("restores on that turn's end and never bleeds into the next turn", () => {
     const g = createThinkingGovernor(GOV);
     const api = fakeThinking("high");
     g.onLoop(api);
-    assert.ok(g.isLowered());
-    g.onPrompt(api);
+    g.onTurnStart(api);
+    assert.equal(api.calls[api.calls.length - 1], "off");
+    g.onTurnEnd(api); // the corrective turn finishes → restore immediately
     assert.equal(api.calls[api.calls.length - 1], "high");
     assert.ok(!g.isLowered());
-    // second prompt is a no-op (nothing pending)
-    const before = api.calls.length;
-    g.onPrompt(api);
-    assert.equal(api.calls.length, before);
+    // a following autonomous turn stays at the model's real level
+    g.onTurnStart(api);
+    g.onTurnEnd(api);
+    assert.equal(api.calls.length, 2); // only the arm→(off,high) pair so far
+    assert.equal(api.calls[api.calls.length - 1], "high");
   });
 
   it("does nothing when already low enough (off/minimal)", () => {
@@ -67,44 +74,72 @@ describe("thinking governor (reduce on loop, restore on prompt)", () => {
       const g = createThinkingGovernor(GOV);
       const api = fakeThinking(lvl);
       g.onLoop(api);
+      g.onTurnStart(api);
       assert.equal(api.calls.length, 0);
-      assert.ok(!g.isLowered());
+      assert.ok(!g.isLowered() && !g.isArmed());
     }
+  });
+
+  it("does not arm when current already equals target", () => {
+    const g = createThinkingGovernor(GOV);
+    const api = fakeThinking("off");
+    g.onLoop(api);
+    assert.ok(!g.isArmed());
+    g.onTurnStart(api);
+    assert.equal(api.calls.length, 0);
   });
 
   it("is inert when disabled", () => {
     const g = createThinkingGovernor({ ...GOV, enabled: false });
     const api = fakeThinking("high");
     g.onLoop(api);
+    g.onTurnStart(api);
+    g.onTurnEnd(api);
     assert.equal(api.calls.length, 0);
   });
 
-  it("reduces only once per episode", () => {
+  it("arms only once per episode (no re-arm while armed or lowered)", () => {
     const g = createThinkingGovernor(GOV);
     const api = fakeThinking("medium");
     g.onLoop(api);
-    g.onLoop(api);
-    g.onLoop(api);
-    assert.equal(api.calls.length, 1); // exactly one set to target
-    assert.equal(api.calls[0], "off");
+    g.onLoop(api); // ignored: already armed
+    g.onTurnStart(api);
+    g.onLoop(api); // ignored: already lowered for this turn
+    g.onTurnEnd(api);
+    // exactly the applied pair: off then restore high
+    assert.deepEqual(api.calls, ["off", "medium"]);
   });
 
-  it("does not reduce when current already equals target", () => {
+  it("onPrompt clears a stale arm that never reached a turn (no lowering)", () => {
     const g = createThinkingGovernor(GOV);
-    const api = fakeThinking("off");
-    g.onLoop(api);
-    assert.equal(api.calls.length, 0);
+    const api = fakeThinking("high");
+    g.onLoop(api); // armed
+    g.onPrompt(api); // the corrective turn never started
+    assert.ok(!g.isArmed() && !g.isLowered());
+    assert.equal(api.calls.length, 0); // never lowered, so nothing to restore
   });
 
-  it("onSessionStart forgets a pending reduction without restoring", () => {
+  it("onPrompt safety-restores a lingering drop whose turn_end never fired", () => {
     const g = createThinkingGovernor(GOV);
     const api = fakeThinking("high");
     g.onLoop(api);
+    g.onTurnStart(api); // lowered, but its turn_end is lost
+    assert.ok(g.isLowered());
+    g.onPrompt(api); // safety net
+    assert.equal(api.calls[api.calls.length - 1], "high");
+    assert.ok(!g.isLowered());
+  });
+
+  it("onSessionStart clears armed + lowered without emitting a restore", () => {
+    const g = createThinkingGovernor(GOV);
+    const api = fakeThinking("high");
+    g.onLoop(api);
+    g.onTurnStart(api);
     assert.ok(g.isLowered());
     g.onSessionStart();
-    assert.ok(!g.isLowered());
+    assert.ok(!g.isLowered() && !g.isArmed());
     const before = api.calls.length;
-    g.onPrompt(api);
+    g.onTurnEnd(api);
     assert.equal(api.calls.length, before); // no restore scheduled
   });
 });

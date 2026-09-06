@@ -19,10 +19,13 @@
  * instructive reason (that is the steer); re-issuing the exact same blocked
  * call aborts the turn.
  *
- * On a detected loop the guard also *reduces reasoning effort* for the corrective
- * turn (via `pi.setThinkingLevel`), since repetition collapses breed in reasoning
- * output — a less-reasoning turn is cheaper and less loop-prone. The original
- * level is restored on the next genuine user prompt. Disable with
+ * On a detected loop the guard also *reduces reasoning effort* for the single
+ * corrective turn (via `pi.setThinkingLevel`), since repetition collapses breed in
+ * reasoning output — a less-reasoning turn is cheaper and less loop-prone. The
+ * reduction is bound to exactly that one auto-resume turn: armed on detection,
+ * applied on its `turn_start`, and undone on its `turn_end`, so it never bleeds
+ * into the autonomous turns that follow. A genuine user prompt is a final safety
+ * net that clears an arm/undo that never completed. Disable with
  * `PI_ANTI_LOOP_THINK_ON_LOOP_DISABLE=1`; set the target level with
  * `PI_ANTI_LOOP_THINK_ON_LOOP` (default `off`).
  *
@@ -84,6 +87,11 @@ interface InputEventLite {
   type?: string;
 }
 
+/** Only the turn lifecycle matters; the turn index/timestamp payload is ignored. */
+interface TurnEventLite {
+  turnIndex?: number;
+}
+
 export default function (pi: PiLike): void {
   if (process.env.PI_ANTI_LOOP_DISABLE === "1") return;
 
@@ -121,6 +129,12 @@ export default function (pi: PiLike): void {
     controller.resetPromptBudget();
     thinking.onPrompt(pi, ctx?.ui);
   });
+
+  // The thinking reduction is bound to exactly the one corrective turn: applied
+  // when that turn starts, undone the instant it ends, so it never bleeds into
+  // the autonomous turns that follow within the same agent run.
+  pi.on("turn_start", (_e: TurnEventLite) => thinking.onTurnStart(pi));
+  pi.on("turn_end", (_e: TurnEventLite, ctx: CtxLite) => thinking.onTurnEnd(pi, ctx?.ui));
 
   pi.on("tool_call", (event: ToolCallEventLite, ctx: CtxLite) => {
     // The pi event delivers untyped tool arguments; decode them into the

@@ -82,10 +82,12 @@ acts on the user's own interactive turn, not just cheap worker subprocesses.
 Repetition collapses almost always live in the model's **reasoning** output — and a
 reasoning turn that spins is both expensive and self-reinforcing. So the moment any
 loop signal fires, the guard temporarily **drops the thinking level** (via
-`pi.setThinkingLevel`, clamped to the model's capabilities) so the steer/abort and its
-auto-resume corrective turn reason less. The **original** level is remembered and restored
-on the next genuine user prompt, so the reduction is scoped to the stuck episode and never
-silently sticks. It is a no-op when reasoning is already `off`/`minimal` (e.g. an
+`pi.setThinkingLevel`, clamped to the model's capabilities) so the auto-resume **corrective
+reply reasons less**. The reduction is bound to **exactly that one turn**: armed when the
+loop is detected, applied on the corrective turn's `turn_start`, and undone on its
+`turn_end` — so it never bleeds into the autonomous turns that follow. (A genuine user
+prompt is only a final safety net for an arm/undo that somehow never completed.) It is a
+no-op when reasoning is already `off`/`minimal` (e.g. an
 observational-memory worker running `--thinking off`), so it never touches non-reasoning runs.
 
 | Var                                  | Default | Meaning                                                               |
