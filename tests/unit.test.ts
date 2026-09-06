@@ -12,6 +12,7 @@ import {
   truncate,
   repeatedSegment,
   tokenSimilarity,
+  detectRepetition,
   readOptions,
   DEFAULT_OPTIONS,
   type LoopOptions,
@@ -483,5 +484,56 @@ describe("helpers", () => {
   it("truncate keeps short text and ellipsizes long text", () => {
     assert.equal(truncate("short", 80), "short");
     assert.equal(truncate("abcdef", 3), "abc…");
+  });
+});
+
+const STREAM_CFG = { minRepeats: 32, minChars: 320, maxPeriod: 32 };
+
+describe("detectRepetition (mid-stream intra-turn collapse)", () => {
+  it("catches a 'duct duct…' collapse and reports the 4-char period", () => {
+    const det = detectRepetition("duct".repeat(100), STREAM_CFG);
+    assert.ok(det, "should detect the duct loop");
+    assert.equal(det!.periodLength, 4);
+    assert.ok(det!.repeats >= 32);
+    assert.equal(det!.sample, "duct");
+  });
+
+  it("returns null for text shorter than minChars", () => {
+    assert.equal(detectRepetition("duct".repeat(10), STREAM_CFG), null);
+  });
+
+  it("returns null for ordinary varied prose", () => {
+    let prose = "";
+    for (let i = 0; i < 200; i++) prose += `tok${i} `;
+    assert.equal(detectRepetition(prose, STREAM_CFG), null);
+  });
+
+  it("ignores whitespace/punctuation-only periods", () => {
+    assert.equal(detectRepetition(" ".repeat(500), STREAM_CFG), null);
+    assert.equal(detectRepetition("-".repeat(500), STREAM_CFG), null);
+  });
+
+  it("honours minRepeats (a tiling below the threshold is not a loop)", () => {
+    const cfg = { minRepeats: 10, minChars: 40, maxPeriod: 8 };
+    assert.equal(detectRepetition("abcd".repeat(9), cfg), null, "9 < 10 → no loop");
+    assert.ok(detectRepetition("abcd".repeat(12), cfg), "12 >= 10 → loop");
+  });
+
+  it("honours maxPeriod (a period longer than the cap is not a loop)", () => {
+    const unit = "abcdefghijkl"; // 12-char unit
+    assert.equal(
+      detectRepetition(unit.repeat(40), { minRepeats: 30, minChars: 320, maxPeriod: 8 }),
+      null,
+      "12 > maxPeriod 8 → no loop",
+    );
+    assert.ok(
+      detectRepetition(unit.repeat(40), { minRepeats: 30, minChars: 320, maxPeriod: 16 }),
+      "12 <= maxPeriod 16 → loop",
+    );
+  });
+
+  it("still fires through small per-block noise", () => {
+    const s = "ductductxuct".repeat(40); // every unit has 1 mismatched char region
+    assert.ok(detectRepetition(s, STREAM_CFG), "12% noise tolerance catches it");
   });
 });

@@ -4,7 +4,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { LoopDetector } from "../extensions/detector.ts";
+import { DEFAULT_OPTIONS, LoopDetector } from "../extensions/detector.ts";
 import { createController } from "../extensions/controller.ts";
 import {
   textLoop,
@@ -17,10 +17,14 @@ import {
   healthySession,
 } from "./fixtures.ts";
 
+// The loop fixtures assert DETECTOR semantics at a known threshold; pin it so the
+// shipped (conservative) default does not silently change what these prove.
+const pinned = { ...DEFAULT_OPTIONS, textRepeatThreshold: 3 };
+
 describe("fixtures: verbatim text loops (controller path)", () => {
   for (const fixture of [textLoop, textLoopBuildProgram]) {
     it(`steers then aborts: ${fixture.name}`, () => {
-      const c = createController();
+      const c = createController(pinned);
       let steered = false;
       let aborted = false;
       for (const message of fixture.messages) {
@@ -38,7 +42,7 @@ describe("fixtures: verbatim text loops (controller path)", () => {
 describe("fixtures: identical tool calls (controller path)", () => {
   for (const fixture of [toolLoopGhRunView, toolLoopGrepSameFile]) {
     it(`blocks: ${fixture.name}`, () => {
-      const c = createController();
+      const c = createController(pinned);
       let blocked = false;
       fixture.calls.forEach((call, i) => {
         const outcome = c.onToolCall(call.tool, call.args, `call-${i}`);
@@ -53,7 +57,7 @@ describe("fixtures: identical tool calls (controller path)", () => {
 describe("fixtures: growing self-concatenation loops (within-message signal)", () => {
   for (const fixture of [growingTextLoop, growingTextLoopSpaced, regexRepeatLoop]) {
     it(`steers then aborts: ${fixture.name}`, () => {
-      const c = createController();
+      const c = createController(pinned);
       let steered = false;
       let aborted = false;
       for (const message of fixture.messages) {
@@ -70,7 +74,7 @@ describe("fixtures: growing self-concatenation loops (within-message signal)", (
 
 describe("fixtures: healthy session is not flagged", () => {
   it("varied reads/edits with progress produce no block", () => {
-    const c = createController();
+    const c = createController(pinned);
     let blocked = 0;
     healthySession.calls.forEach((call, i) => {
       const outcome = c.onToolCall(call.tool, call.args, `call-${i}`);
@@ -83,7 +87,7 @@ describe("fixtures: healthy session is not flagged", () => {
 
 describe("fixtures: mixed sessions", () => {
   it("a loop that briefly makes progress still gets caught when it returns to the loop", () => {
-    const c = createController();
+    const c = createController(pinned);
     // Two distinct reads (progress), then the gh-run-view loop resumes.
     c.onToolCall("read", { path: "a.ts" }, "1");
     c.onToolCall("read", { path: "b.ts" }, "2");
@@ -97,7 +101,7 @@ describe("fixtures: mixed sessions", () => {
   });
 
   it("failing the same tool 3x then retrying is blocked with the failure reason", () => {
-    const c = createController();
+    const c = createController(pinned);
     // Different commands each time — isolates the failure-streak signal.
     const cmds = ["npm test", "npm run lint", "npm run build"];
     for (let i = 0; i < 3; i++) {
@@ -111,7 +115,7 @@ describe("fixtures: mixed sessions", () => {
 
 describe("fixtures: detector-level sanity", () => {
   it("detector directly flags the text-loop fixture", () => {
-    const d = new LoopDetector();
+    const d = new LoopDetector(pinned);
     let hit = false;
     for (const m of textLoop.messages) {
       if (d.checkText(m).isOk()) hit = true;
@@ -120,7 +124,7 @@ describe("fixtures: detector-level sanity", () => {
   });
 
   it("detector directly blocks the grep fixture", () => {
-    const d = new LoopDetector();
+    const d = new LoopDetector(pinned);
     let blocked = false;
     for (const call of toolLoopGrepSameFile.calls) {
       if (d.check(call.tool, call.args).isOk()) blocked = true;

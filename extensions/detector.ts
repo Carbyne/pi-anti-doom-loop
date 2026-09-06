@@ -35,17 +35,45 @@ export interface LoopOptions {
   failRateMinCalls: number;
   /** Tool names to skip detection for entirely (intentional repetition). */
   toolExclude: Set<string>;
+  /**
+   * Token-overlap similarity (0..1) that counts as "near-identical" for the
+   * cross-message text signals. HIGHER = more conservative (fewer false
+   * positives on legitimately rephrased steps). Optional so existing callers /
+   * fixtures that build a full literal keep compiling; defaults via
+   * `?? TEXT_SIMILARITY_THRESHOLD`.
+   */
+  textSimilarityThreshold?: number;
+  /** Mid-stream (token-by-token) intra-turn repetition guard. On unless `false`. */
+  streamEnabled?: boolean;
+  /** Whole copies of a short unit before the stream guard fires. */
+  streamMinRepeats?: number;
+  /** Trailing window that must be tiled to count as a loop. */
+  streamMinChars?: number;
+  /** Largest candidate period length. */
+  streamMaxPeriod?: number;
+  /** Hard per-turn generated-text cap; beyond it the stream guard fires. 0 disables the cap. */
+  streamMaxTurnChars?: number;
 }
 
 export const DEFAULT_OPTIONS: LoopOptions = {
   repeatThreshold: 3,
   failThreshold: 3,
   windowSize: 10,
-  textRepeatThreshold: 3,
+  // 5, not 3: the cross-message text signals (verbatim/near-identical/cycle) are
+  // the false-positive-prone ones — legitimately rephrased multi-step work trips
+  // them. The mid-stream guard below catches real text loops precisely, so this
+  // heuristic can afford to be conservative. Lower via PI_ANTI_LOOP_TEXT_REPEATS.
+  textRepeatThreshold: 5,
   timeWindowMs: 0,
   failRateThreshold: 0,
   failRateMinCalls: 3,
   toolExclude: new Set(),
+  textSimilarityThreshold: 0.8,
+  streamEnabled: true,
+  streamMinRepeats: 32,
+  streamMinChars: 320,
+  streamMaxPeriod: 32,
+  streamMaxTurnChars: 40_000,
 };
 
 export function readOptions(env: Record<string, string | undefined> = process.env): LoopOptions {
@@ -65,6 +93,15 @@ export function readOptions(env: Record<string, string | undefined> = process.en
       .map((s) => s.trim())
       .filter(Boolean),
   );
+  // A plain >=min reader for the mid-stream knobs (they are not tool-call
+  // thresholds, so the `num()` >=2 floor does not fit all of them).
+  const snum = (key: string, min: number, fallback: number): number => {
+    const raw = env[key];
+    if (!raw) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= min ? n : fallback;
+  };
+  const similarity = Number(env["PI_ANTI_LOOP_TEXT_SIMILARITY"] ?? "");
   return {
     repeatThreshold: num("PI_ANTI_LOOP_REPEATS", DEFAULT_OPTIONS.repeatThreshold),
     failThreshold: num("PI_ANTI_LOOP_FAILS", DEFAULT_OPTIONS.failThreshold),
@@ -74,6 +111,30 @@ export function readOptions(env: Record<string, string | undefined> = process.en
     failRateThreshold: Number.isFinite(failRate) ? Math.min(1, Math.max(0, failRate)) : 0,
     failRateMinCalls: num("PI_ANTI_LOOP_FAIL_RATE_MIN", DEFAULT_OPTIONS.failRateMinCalls),
     toolExclude,
+    textSimilarityThreshold: Number.isFinite(similarity)
+      ? Math.min(1, Math.max(0, similarity))
+      : (DEFAULT_OPTIONS.textSimilarityThreshold ?? 0.8),
+    streamEnabled: env["PI_ANTI_LOOP_STREAM"] !== "0",
+    streamMinRepeats: snum(
+      "PI_ANTI_LOOP_STREAM_REPEATS",
+      4,
+      DEFAULT_OPTIONS.streamMinRepeats ?? 32,
+    ),
+    streamMinChars: snum(
+      "PI_ANTI_LOOP_STREAM_MIN_CHARS",
+      40,
+      DEFAULT_OPTIONS.streamMinChars ?? 320,
+    ),
+    streamMaxPeriod: snum(
+      "PI_ANTI_LOOP_STREAM_MAX_PERIOD",
+      2,
+      DEFAULT_OPTIONS.streamMaxPeriod ?? 32,
+    ),
+    streamMaxTurnChars: snum(
+      "PI_ANTI_LOOP_STREAM_MAX_TURN_CHARS",
+      1_000,
+      DEFAULT_OPTIONS.streamMaxTurnChars ?? 40_000,
+    ),
   };
 }
 
@@ -242,9 +303,10 @@ export class LoopDetector {
     // OR near-identical (token-overlap similarity). Catches loops where the
     // model slightly rephrases each turn ("inspect the failing test" →
     // "examine the failing assertion") so exact matching never fires.
+    const similarityFloor = this.opts.textSimilarityThreshold ?? TEXT_SIMILARITY_THRESHOLD;
     const similar =
       norm === this.lastText ||
-      (this.lastText !== null && tokenSimilarity(norm, this.lastText) >= TEXT_SIMILARITY_THRESHOLD);
+      (this.lastText !== null && tokenSimilarity(norm, this.lastText) >= similarityFloor);
     this.textStreak = similar ? this.textStreak + 1 : 1;
     this.lastText = norm;
     if (this.textStreak >= this.opts.textRepeatThreshold) {
@@ -262,7 +324,7 @@ export class LoopDetector {
     // texts accumulating to textRepeatThreshold within the window fire here.
     const similarCount =
       this.recentTexts.filter(
-        (t) => t.text !== norm && tokenSimilarity(norm, t.text) >= TEXT_SIMILARITY_THRESHOLD,
+        (t) => t.text !== norm && tokenSimilarity(norm, t.text) >= similarityFloor,
       ).length + 1;
     if (similarCount >= this.opts.textRepeatThreshold) {
       return Result.ok({
@@ -475,6 +537,66 @@ export function repeatedSegment(normalized: string, threshold: number): string |
   return null;
 }
 
+/**
+ * Mid-stream intra-turn repetition: the model emits a short unit over and over
+ * inside a SINGLE streamed turn that never terminates ("BSRRductductduct…"). The
+ * cross-message text signals cannot see it — they evaluate at `message_end`,
+ * which never fires for a turn that never ends, and `repeatedSegment` splits on
+ * sentence punctuation (>= MIN_REPEAT_CHUNK) so a 4-char "duct" tiling is invisible
+ * to it. This is evaluated on `message_update` deltas instead.
+ *
+ * Pure + pi-free so it is unit-testable and reusable. Returns the detection or
+ * null. Scans the trailing `minChars` window; a candidate period `p` qualifies
+ * when the region is tiled by it (allowing <=12% mismatched chars per block) at
+ * least `minRepeats` times, and the unit is not just whitespace/punctuation.
+ */
+export interface RepetitionConfig {
+  /** Whole copies of the unit required. */
+  minRepeats: number;
+  /** Trailing window that must be tiled. */
+  minChars: number;
+  /** Largest candidate period. */
+  maxPeriod: number;
+}
+export interface RepetitionDetection {
+  periodLength: number;
+  repeats: number;
+  sample: string;
+}
+
+const REPETITION_NOISE_RATIO = 0.12;
+
+export function detectRepetition(text: string, cfg: RepetitionConfig): RepetitionDetection | null {
+  const { minRepeats, minChars, maxPeriod } = cfg;
+  if (minChars <= 0 || minRepeats < 2 || text.length < minChars) return null;
+  const cap = Math.min(maxPeriod, text.length);
+  for (let p = 1; p <= cap; p++) {
+    const unit = text.slice(text.length - p);
+    if (!/[a-zA-Z0-9]/.test(unit)) continue; // skip whitespace/punct-only "periods"
+    const allowed = Math.floor(p * REPETITION_NOISE_RATIO);
+    let blocks = 0;
+    let i = text.length;
+    while (i - p >= 0) {
+      const block = text.slice(i - p, i);
+      let mism = 0;
+      for (let k = 0; k < p; k++) {
+        if (block[k] !== unit[k]) {
+          mism++;
+          if (mism > allowed) break;
+        }
+      }
+      if (mism > allowed) break;
+      blocks++;
+      i -= p;
+      if (blocks >= minRepeats && blocks * p >= minChars) break;
+    }
+    if (blocks >= minRepeats && blocks * p >= minChars) {
+      return { periodLength: p, repeats: blocks, sample: unit };
+    }
+  }
+  return null;
+}
+
 // --- self-check (runs under `node extensions/detector.ts`, skipped when loaded by pi) ---
 if (import.meta.main) {
   const opts: LoopOptions = {
@@ -603,7 +725,11 @@ if (import.meta.main) {
   });
   assert.equal(clamped.repeatThreshold, 3, "1 falls back to default");
   assert.equal(clamped.failThreshold, 3, "0 falls back to default");
-  assert.equal(clamped.textRepeatThreshold, 3, "negative falls back to default");
+  assert.equal(
+    clamped.textRepeatThreshold,
+    DEFAULT_OPTIONS.textRepeatThreshold,
+    "negative falls back to default",
+  );
   const two = readOptions({ PI_ANTI_LOOP_REPEATS: "2" });
   assert.equal(two.repeatThreshold, 2, "2 is the minimum accepted");
 

@@ -33,6 +33,8 @@ import {
   type CtxLite,
   type MessageContent,
   type MessageEndEventLite,
+  type MessageStartEventLite,
+  type MessageUpdateEventLite,
   type ToolCallEventLite,
   type ToolResultEventLite,
 } from "./controller.ts";
@@ -117,6 +119,43 @@ export default function (pi: PiLike): void {
       return;
     }
 
+    ctx.ui.notify(`Anti-doom-loop: ${outcome.reason}`, "error");
+    ctx.abort();
+    if (outcome.resume) {
+      pi.sendMessage?.(
+        { customType: "anti-doom-loop", content: RESUME_TEXT, display: true },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+    }
+  });
+
+  // Mid-stream intra-turn repetition ("duct duct…"): the model streams one
+  // never-terminating turn, so message_end never fires and the cross-message
+  // text signals are blind to it. Watch the streaming deltas instead. Only
+  // text/thinking deltas are scanned — tool-call arg deltas (a consolidator
+  // legitimately writing a large file) are NEVER treated as a doom loop.
+  pi.on("message_start", (event: MessageStartEventLite) => {
+    const role = event.message?.role;
+    if (role === undefined || role === "assistant") controller.onMessageStart();
+  });
+
+  pi.on("message_update", (event: MessageUpdateEventLite, ctx: CtxLite) => {
+    const ae = event.assistantMessageEvent;
+    if (!ae) return;
+    const deltaType =
+      ae.type === "text_delta" ? "text" : ae.type === "thinking_delta" ? "thinking" : null;
+    if (deltaType === null) return; // toolcall_delta etc. is not generated prose
+    const outcome = controller.onMessageUpdate("assistant", deltaType, ae.delta ?? "");
+    if (outcome === null) return;
+
+    if (outcome.action === "steer") {
+      ctx.ui.notify(`Anti-doom-loop: ${outcome.reason}`, "warning");
+      pi.sendMessage?.(
+        { customType: "anti-doom-loop", content: STEER_TEXT, display: true },
+        { deliverAs: "steer", triggerTurn: true },
+      );
+      return;
+    }
     ctx.ui.notify(`Anti-doom-loop: ${outcome.reason}`, "error");
     ctx.abort();
     if (outcome.resume) {

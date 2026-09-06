@@ -1,7 +1,7 @@
 {
   "name": "pi-anti-doom-loop",
-  "version": "0.0.8",
-  "description": "Detect and break agent doom loops in pi: blocks identical repeated tool calls and blind retries before they burn tokens.",
+  "version": "0.1.0",
+  "description": "Detect and break agent doom loops in pi: blocks identical repeated tool calls, verbatim/near-identical text, and mid-stream intra-turn token collapses (“duct duct…”) before they burn tokens.",
   "keywords": [
     "anti-doom-loop",
     "loop-detection",
@@ -13,7 +13,7 @@
   "author": "irfandi <join.mantap@gmail.com> (https://github.com/irfndi)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/irfndi/pi-anti-doom-loop.git"
+    "url": "git+https://github.com/Carbyne/pi-anti-doom-loop.git"
   },
   "files": [
     "extensions",

@@ -10,8 +10,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createController, extractText } from "../extensions/controller.ts";
+import { DEFAULT_OPTIONS } from "../extensions/detector.ts";
 import indexDefault from "../extensions/index.ts";
 import type { PiLike } from "../extensions/index.ts";
+
+// Pin the text-loop threshold the controller message tests exercise, so the
+// shipped (conservative) default does not change what these assert.
+const pinned = { ...DEFAULT_OPTIONS, textRepeatThreshold: 3 };
 
 function makeFakePi() {
   const handlers = new Map<string, (event: any, ctx: any) => unknown>();
@@ -51,7 +56,7 @@ const fakeCtx = () => ({
 
 describe("controller: tool-call lifecycle", () => {
   it("blocks identical calls and skips the blocked result in failure counting", () => {
-    const c = createController();
+    const c = createController(pinned);
     // Two identical allowed calls.
     assert.equal(c.onToolCall("bash", { command: "grep foo" }, "c1"), null);
     c.onToolResult("bash", "c1", false);
@@ -73,7 +78,7 @@ describe("controller: tool-call lifecycle", () => {
   });
 
   it("blocked-result exclusion matters: without it, one blocked error would seed the failure streak", () => {
-    const c = createController();
+    const c = createController(pinned);
     // Three DIFFERENT commands failing (repeat signal never fires) — the
     // next bash call must block by the failure streak, not by repetition.
     const cmds = ["npm test", "npm run lint", "npm run build"];
@@ -88,7 +93,7 @@ describe("controller: tool-call lifecycle", () => {
 
 describe("controller: message lifecycle", () => {
   it("returns an abort reason for a verbatim assistant loop", () => {
-    const c = createController();
+    const c = createController(pinned);
     const msg = (t: string) => [{ type: "text", text: t }];
     assert.equal(c.onMessageEnd("assistant", msg("Let me fetch the merge ref:")), null);
     assert.equal(c.onMessageEnd("assistant", msg("Let me fetch the merge ref:")), null);
@@ -97,7 +102,7 @@ describe("controller: message lifecycle", () => {
   });
 
   it("aborts on duplicate identical tool calls batched in ONE assistant message", () => {
-    const c = createController();
+    const c = createController(pinned);
     const spam = (n: number, command = "true") =>
       Array.from({ length: n }, () => ({ type: "toolCall", name: "bash", arguments: { command } }));
     const hit = c.onMessageEnd("assistant", spam(3) as any);
@@ -106,7 +111,7 @@ describe("controller: message lifecycle", () => {
   });
 
   it("allows parallel calls with distinct args or below-threshold duplicates", () => {
-    const c = createController();
+    const c = createController(pinned);
     const distinct = [
       { type: "toolCall", name: "read", arguments: { path: "a.ts" } },
       { type: "toolCall", name: "read", arguments: { path: "b.ts" } },
@@ -121,7 +126,7 @@ describe("controller: message lifecycle", () => {
   });
 
   it("ignores non-assistant roles and non-text content", () => {
-    const c = createController();
+    const c = createController(pinned);
     assert.equal(c.onMessageEnd("user", [{ type: "text", text: "x" }]), null);
     assert.equal(c.onMessageEnd("toolResult", [{ type: "text", text: "x" }]), null);
     assert.equal(c.onMessageEnd("assistant", [{ type: "image" }]), null);
@@ -140,7 +145,7 @@ describe("controller: message lifecycle", () => {
 
 describe("controller: steer → abort → bounded resume", () => {
   it("first detection steers, second aborts with resume, third aborts for real", () => {
-    const c = createController();
+    const c = createController(pinned);
     const msg = (t: string) => [{ type: "text", text: t }];
     const loop = "Let me fetch the merge ref:";
     const fire = () => c.onMessageEnd("assistant", msg(loop));
@@ -163,7 +168,7 @@ describe("controller: steer → abort → bounded resume", () => {
   });
 
   it("reset clears the steer flag but keeps the resume budget (session-scoped)", () => {
-    const c = createController();
+    const c = createController(pinned);
     const msg = (t: string) => [{ type: "text", text: t }];
     const loop = "Let me fetch the merge ref:";
     const fire = () => c.onMessageEnd("assistant", msg(loop));
@@ -188,7 +193,7 @@ describe("controller: steer → abort → bounded resume", () => {
 
 describe("controller: counters + suspend", () => {
   it("status reports steers and aborts for the session", () => {
-    const c = createController();
+    const c = createController(pinned);
     const msg = (t: string) => [{ type: "text", text: t }];
     const loop = "Let me fetch the merge ref:";
     const fire = () => c.onMessageEnd("assistant", msg(loop));
@@ -203,7 +208,7 @@ describe("controller: counters + suspend", () => {
   });
 
   it("suspend disables detection until reset", () => {
-    const c = createController();
+    const c = createController(pinned);
     const msg = (t: string) => [{ type: "text", text: t }];
     const loop = "Let me fetch the merge ref:";
     // build a streak so detection would fire
@@ -237,7 +242,7 @@ describe("controller: counters + suspend", () => {
 
 describe("controller: reset", () => {
   it("clears streaks and blocked ids", () => {
-    const c = createController();
+    const c = createController(pinned);
     c.onToolCall("bash", { command: "grep foo" }, "c1");
     c.onToolCall("bash", { command: "grep foo" }, "c2");
     assert.ok(c.onToolCall("bash", { command: "grep foo" }, "c3") !== null);
@@ -254,7 +259,7 @@ describe("controller: reset", () => {
   });
 
   it("status exposes thresholds and counters", () => {
-    const c = createController();
+    const c = createController(pinned);
     const s = c.status();
     assert.match(s, /repeats>=3\/window 10/);
     assert.match(s, /fails>=3/);
@@ -305,31 +310,40 @@ describe("index.ts adapter (fake PiLike)", () => {
   });
 
   it("wires message_end → steer first, then abort + bounded resume", () => {
-    const { pi, fire, sent } = makeFakePi();
-    indexDefault(pi);
-    const aborts: string[] = [];
-    const ctx = { ...fakeCtx(), abort: () => aborts.push("abort") };
-    const msg = (t: string) => [{ type: "text", text: t }];
-    const loop = "Let me fetch the merge ref:";
-    const fireMsg = () =>
-      fire("message_end", { message: { role: "assistant", content: msg(loop) } }, ctx);
+    // The adapter builds its controller from env; pin the text threshold this
+    // test exercises so the shipped (conservative) default does not change it.
+    const prev = process.env.PI_ANTI_LOOP_TEXT_REPEATS;
+    process.env.PI_ANTI_LOOP_TEXT_REPEATS = "3";
+    try {
+      const { pi, fire, sent } = makeFakePi();
+      indexDefault(pi);
+      const aborts: string[] = [];
+      const ctx = { ...fakeCtx(), abort: () => aborts.push("abort") };
+      const msg = (t: string) => [{ type: "text", text: t }];
+      const loop = "Let me fetch the merge ref:";
+      const fireMsg = () =>
+        fire("message_end", { message: { role: "assistant", content: msg(loop) } }, ctx);
 
-    fireMsg(); // streak 1 — nothing
-    fireMsg(); // streak 2 — nothing
-    fireMsg(); // streak 3 — STEER (no abort, agent continues)
-    assert.equal(aborts.length, 0, "first detection steers, does not abort");
-    assert.equal(sent.length, 1, "a steer message was sent");
-    assert.equal(sent[0].options?.deliverAs, "steer");
-    assert.equal(sent[0].options?.triggerTurn, true);
+      fireMsg(); // streak 1 — nothing
+      fireMsg(); // streak 2 — nothing
+      fireMsg(); // streak 3 — STEER (no abort, agent continues)
+      assert.equal(aborts.length, 0, "first detection steers, does not abort");
+      assert.equal(sent.length, 1, "a steer message was sent");
+      assert.equal(sent[0].options?.deliverAs, "steer");
+      assert.equal(sent[0].options?.triggerTurn, true);
 
-    fireMsg(); // streak 4 — ABORT + resume
-    assert.equal(aborts.length, 1, "persistent loop aborts");
-    assert.equal(sent.length, 2, "a resume directive is queued after the abort");
-    assert.equal(sent[1].options?.deliverAs, "followUp");
+      fireMsg(); // streak 4 — ABORT + resume
+      assert.equal(aborts.length, 1, "persistent loop aborts");
+      assert.equal(sent.length, 2, "a resume directive is queued after the abort");
+      assert.equal(sent[1].options?.deliverAs, "followUp");
 
-    fireMsg(); // streak 5 — abort for real (resume budget spent)
-    assert.equal(aborts.length, 2, "looping after resume aborts again");
-    assert.equal(sent.length, 2, "no second resume — budget is bounded");
+      fireMsg(); // streak 5 — abort for real (resume budget spent)
+      assert.equal(aborts.length, 2, "looping after resume aborts again");
+      assert.equal(sent.length, 2, "no second resume — budget is bounded");
+    } finally {
+      if (prev === undefined) delete process.env.PI_ANTI_LOOP_TEXT_REPEATS;
+      else process.env.PI_ANTI_LOOP_TEXT_REPEATS = prev;
+    }
   });
 
   it("resets counters on before_agent_start", () => {
@@ -368,5 +382,87 @@ describe("index.ts adapter (fake PiLike)", () => {
 
     await cmd!.handler("reset", ctx as any);
     assert.match(notices[3], /counters reset/);
+  });
+});
+
+describe("controller: mid-stream intra-turn guard", () => {
+  const stream = { ...DEFAULT_OPTIONS };
+  it("steers on a duct collapse, aborts if it continues", () => {
+    const c = createController(stream);
+    c.onMessageStart();
+    const duct = "duct".repeat(300);
+    const o = c.onMessageUpdate("assistant", "text", duct);
+    assert.ok(o && o.action === "steer", "first hit steers");
+    const o2 = c.onMessageUpdate("assistant", "text", duct);
+    assert.ok(o2 && o2.action === "abort", "still looping aborts");
+  });
+  it("ignores non-text deltas and non-assistant roles", () => {
+    const c = createController(stream);
+    c.onMessageStart();
+    assert.equal(c.onMessageUpdate("assistant", "toolcall", "duct".repeat(300)), null);
+    assert.equal(c.onMessageUpdate("user", "text", "duct".repeat(300)), null);
+  });
+  it("does not fire on ordinary prose", () => {
+    const c = createController(stream);
+    c.onMessageStart();
+    let prose = "";
+    for (let i = 0; i < 400; i++) prose += `w${i} `;
+    assert.equal(c.onMessageUpdate("assistant", "text", prose), null);
+  });
+  it("is a no-op when the guard is disabled", () => {
+    const c = createController({ ...DEFAULT_OPTIONS, streamEnabled: false });
+    c.onMessageStart();
+    assert.equal(c.onMessageUpdate("assistant", "text", "duct".repeat(400)), null);
+  });
+  it("aborts an over-char-cap turn after one steer", () => {
+    const c = createController({ ...DEFAULT_OPTIONS, streamMaxTurnChars: 1000 });
+    c.onMessageStart();
+    let prose = "";
+    for (let i = 0; i < 400; i++) prose += `w${i} `;
+    const o = c.onMessageUpdate("assistant", "text", prose);
+    assert.ok(o && o.action === "steer", "over-cap steers first");
+    const o2 = c.onMessageUpdate("assistant", "text", prose);
+    assert.ok(o2 && o2.action === "abort", "over-cap after steer aborts");
+  });
+});
+
+describe("index adapter: message_update mid-stream guard", () => {
+  it("steers then aborts a streamed duct loop through the real wiring", () => {
+    const { pi, fire, sent } = makeFakePi();
+    indexDefault(pi);
+    let aborts = 0;
+    const ctx = {
+      ...fakeCtx(),
+      abort: () => {
+        aborts++;
+      },
+    };
+    fire("message_start", { message: { role: "assistant" } }, ctx);
+    const duct = "duct".repeat(300);
+    fire("message_update", { assistantMessageEvent: { type: "text_delta", delta: duct } }, ctx);
+    assert.equal(aborts, 0, "first hit steers, no abort");
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].options?.deliverAs, "steer");
+    fire("message_update", { assistantMessageEvent: { type: "text_delta", delta: duct } }, ctx);
+    assert.equal(aborts, 1, "continued loop aborts");
+  });
+  it("never scans toolcall_delta (a big file write is not a loop)", () => {
+    const { pi, fire, sent } = makeFakePi();
+    indexDefault(pi);
+    let aborts = 0;
+    const ctx = {
+      ...fakeCtx(),
+      abort: () => {
+        aborts++;
+      },
+    };
+    fire("message_start", { message: { role: "assistant" } }, ctx);
+    fire(
+      "message_update",
+      { assistantMessageEvent: { type: "toolcall_delta", delta: "x".repeat(20000) } },
+      ctx,
+    );
+    assert.equal(sent.length, 0);
+    assert.equal(aborts, 0);
   });
 });

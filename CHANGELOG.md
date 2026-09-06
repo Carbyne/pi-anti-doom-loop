@@ -2,6 +2,32 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.1.0] — Carbyne fork
+
+### Added
+
+- **Mid-stream intra-turn repetition guard** (`PI_ANTI_LOOP_STREAM_*`). Catches the doom-loop
+  shape upstream can't see: a single streamed assistant turn that never terminates while
+  repeating a short fragment (`…ductductduct…`). Because that turn never reaches
+  `message_end`, the cross-message text detectors are blind to it, so the guard evaluates the
+  `message_update` text/thinking deltas directly. On detection it runs the same
+  steer → abort → bounded-resume ladder. Scans **prose only** — `toolcall_delta` (a legitimately
+  streamed large file write) is never scanned; whitespace/punctuation-only candidate units are
+  ignored. New env: `PI_ANTI_LOOP_STREAM` (`0` to disable), `PI_ANTI_LOOP_STREAM_REPEATS` (32),
+  `PI_ANTI_LOOP_STREAM_MIN_CHARS` (320), `PI_ANTI_LOOP_STREAM_MAX_PERIOD` (32),
+  `PI_ANTI_LOOP_STREAM_MAX_TURN_CHARS` (40000). Pure detector `detectRepetition` lives in
+  `detector.ts`; the stateful watcher in `controller.ts` (`onMessageStart`/`onMessageUpdate`).
+- **`PI_ANTI_LOOP_TEXT_SIMILARITY`** — the near-identical token-overlap threshold was previously
+  hardcoded; it is now configurable (`0..1`, higher = more conservative).
+
+### Changed
+
+- **Conservative text defaults** — the false-positive-prone cross-message text signals now default
+  to `textRepeatThreshold: 5` (was 3) and near-identical similarity `0.8` (was 0.55), so a
+  legitimately rephrasing main agent trips them far less often; the mid-stream guard catches real
+  text loops precisely. All still tunable via `PI_ANTI_LOOP_TEXT_REPEATS` /
+  `PI_ANTI_LOOP_TEXT_SIMILARITY`. Tool-call detection defaults are unchanged.
+
 ## [0.0.8] — 2026-08-24
 
 ### Added

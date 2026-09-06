@@ -12,7 +12,7 @@
  * The resume budget is session-scoped: `reset()` (per user prompt) keeps it,
  * a fresh session (new controller) starts over.
  */
-import { LoopDetector, readOptions } from "./detector.ts";
+import { LoopDetector, detectRepetition, readOptions, truncate } from "./detector.ts";
 import type { LoopOptions, ToolInput } from "./detector.ts";
 
 /** Minimal shapes of the pi events the controller consumes (structural). */
@@ -28,6 +28,12 @@ export interface ToolResultEventLite {
 }
 export interface MessageEndEventLite {
   message: { role: string; content?: unknown };
+}
+export interface MessageStartEventLite {
+  message?: { role?: string };
+}
+export interface MessageUpdateEventLite {
+  assistantMessageEvent?: { type?: string; delta?: string };
 }
 export interface CtxLite {
   ui: { notify(message: string, level: string): void };
@@ -66,6 +72,9 @@ export interface TextLoopOutcome {
 /** How many auto-resumes per session before we hand control back for real. */
 export const RESUME_BUDGET = 1;
 
+/** Re-evaluate the mid-stream guard only every this many new chars (cheap throttle). */
+export const STREAM_CHECK_STRIDE = 256;
+
 export interface AntiLoopController {
   /** Returns a block decision for a tool call, or null to let it run. */
   onToolCall(toolName: string, input: ToolInput, toolCallId: string): ToolCallOutcome | null;
@@ -73,6 +82,14 @@ export interface AntiLoopController {
   onToolResult(toolName: string, toolCallId: string, isError: boolean): void;
   /** Detect assistant-text loops; returns a steer/abort decision or null. */
   onMessageEnd(role: string, content: MessageContent): TextLoopOutcome | null;
+  /** Start tracking a new assistant message for the mid-stream guard. */
+  onMessageStart(): void;
+  /**
+   * Feed one streamed assistant delta to the mid-stream repetition guard. Returns
+   * a steer/abort decision (same ladder as onMessageEnd) or null. `deltaType` is
+   * "text" | "thinking" — tool-call arg deltas are never passed here.
+   */
+  onMessageUpdate(role: string, deltaType: string, delta: string): TextLoopOutcome | null;
   /** Full reset (session start, user prompt, /loopcheck reset). */
   reset(): void;
   /** Suspend detection until the next reset (escape hatch for intentional repetition). */
@@ -91,6 +108,12 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
   let steers = 0;
   let aborts = 0;
   let suspended = false;
+  // Mid-stream (single-turn) repetition guard state — its own steered flag so it
+  // does not couple with the cross-message onMessageEnd ladder.
+  let streamBuf = "";
+  let streamTotal = 0;
+  let streamSince = 0;
+  let streamSteered = false;
 
   return {
     onToolCall(toolName, input, toolCallId) {
@@ -148,11 +171,65 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       return { reason, action: "abort", resume: false };
     },
 
+    onMessageStart() {
+      streamBuf = "";
+      streamTotal = 0;
+      streamSince = 0;
+      streamSteered = false;
+    },
+
+    onMessageUpdate(role, deltaType, delta) {
+      if (suspended) return null;
+      if (role !== "assistant") return null;
+      if (opts.streamEnabled === false) return null;
+      if (deltaType !== "text" && deltaType !== "thinking") return null;
+      if (!delta) return null;
+
+      streamBuf += delta;
+      streamTotal += delta.length;
+      streamSince += delta.length;
+      const keep = Math.max((opts.streamMinChars ?? 320) * 2, 1024);
+      if (streamBuf.length > keep) streamBuf = streamBuf.slice(streamBuf.length - keep);
+      if (streamSince < STREAM_CHECK_STRIDE) return null;
+      streamSince = 0;
+
+      const overCap =
+        (opts.streamMaxTurnChars ?? 0) > 0 && streamTotal > (opts.streamMaxTurnChars ?? 0);
+      const det = detectRepetition(streamBuf, {
+        minRepeats: opts.streamMinRepeats ?? 32,
+        minChars: opts.streamMinChars ?? 320,
+        maxPeriod: opts.streamMaxPeriod ?? 32,
+      });
+      if (!det && !overCap) return null;
+
+      const reason = det
+        ? `assistant turn is stuck repeating "${truncate(det.sample, 24)}" (${det.periodLength}-char unit) ~${det.repeats} times`
+        : `assistant turn ran to ${streamTotal} chars of generated text without stopping`;
+
+      // Same escalation ladder as the message-loop path (shared lifetime counters).
+      if (!streamSteered) {
+        streamSteered = true;
+        steers++;
+        return { reason, action: "steer", resume: false };
+      }
+      if (resumes < RESUME_BUDGET) {
+        resumes++;
+        aborts++;
+        return { reason, action: "abort", resume: true };
+      }
+      aborts++;
+      return { reason, action: "abort", resume: false };
+    },
+
     reset() {
       detector = new LoopDetector(opts);
       blockedIds.clear();
       steered = false;
       suspended = false;
+      streamBuf = "";
+      streamTotal = 0;
+      streamSince = 0;
+      streamSteered = false;
       // resumes/steers/aborts are intentionally NOT reset here: they are
       // session-scoped so a stuck model cannot cycle steer→abort forever and
       // /loopcheck can report lifetime counters.
@@ -176,9 +253,14 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       const rate = o.failRateThreshold > 0 ? `, failRate>=${o.failRateThreshold}` : "";
       const time = o.timeWindowMs > 0 ? `, window ${o.timeWindowMs}ms` : "";
       const excl = o.toolExclude.size ? `, exclude[${[...o.toolExclude].join(",")}]` : "";
+      const stream =
+        o.streamEnabled === false
+          ? "stream=off"
+          : `stream=on(×${o.streamMinRepeats ?? 32}/${o.streamMaxPeriod ?? 32}ch)`;
       return (
         `anti-doom-loop: repeats>=${o.repeatThreshold}/window ${o.windowSize}, ` +
-        `fails>=${o.failThreshold}, text>=${o.textRepeatThreshold}${rate}${time}${excl}. ` +
+        `fails>=${o.failThreshold}, text>=${o.textRepeatThreshold}, ` +
+        `sim>=${(o.textSimilarityThreshold ?? 0.8).toFixed(2)}, ${stream}${rate}${time}${excl}. ` +
         `${detector.diagnostics()} steers=${steers} aborts=${aborts}${s}`
       );
     },
