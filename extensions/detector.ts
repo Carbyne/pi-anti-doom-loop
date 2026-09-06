@@ -20,7 +20,7 @@ export interface LoopOptions {
   failThreshold: number;
   /** How many recent calls/results are inspected for repetition. */
   windowSize: number;
-  /** Verbatim/near-identical assistant-message repeats that trigger a block. */
+  /** Verbatim (exact) assistant-message repeats that trigger a block. */
   textRepeatThreshold: number;
   /** Evict window entries older than this many ms (0 = count-only window). */
   timeWindowMs: number;
@@ -35,14 +35,6 @@ export interface LoopOptions {
   failRateMinCalls: number;
   /** Tool names to skip detection for entirely (intentional repetition). */
   toolExclude: Set<string>;
-  /**
-   * Token-overlap similarity (0..1) that counts as "near-identical" for the
-   * cross-message text signals. HIGHER = more conservative (fewer false
-   * positives on legitimately rephrased steps). Optional so existing callers /
-   * fixtures that build a full literal keep compiling; defaults via
-   * `?? TEXT_SIMILARITY_THRESHOLD`.
-   */
-  textSimilarityThreshold?: number;
   /** Mid-stream (token-by-token) intra-turn repetition guard. On unless `false`. */
   streamEnabled?: boolean;
   /** Whole copies of a short unit before the stream guard fires. */
@@ -59,16 +51,16 @@ export const DEFAULT_OPTIONS: LoopOptions = {
   repeatThreshold: 3,
   failThreshold: 3,
   windowSize: 10,
-  // 5, not 3: the cross-message text signals (verbatim/near-identical/cycle) are
-  // the false-positive-prone ones — legitimately rephrased multi-step work trips
-  // them. The mid-stream guard below catches real text loops precisely, so this
-  // heuristic can afford to be conservative. Lower via PI_ANTI_LOOP_TEXT_REPEATS.
+  // 5, not 3: the cross-message text signals (verbatim window/cycle) are the
+  // false-positive-prone ones even at exact matching — a legitimately reused
+  // short utility line can recur. The mid-stream guard below catches real text
+  // loops precisely, so this heuristic can afford to be conservative. Lower via
+  // PI_ANTI_LOOP_TEXT_REPEATS.
   textRepeatThreshold: 5,
   timeWindowMs: 0,
   failRateThreshold: 0,
   failRateMinCalls: 3,
   toolExclude: new Set(),
-  textSimilarityThreshold: 0.8,
   streamEnabled: true,
   streamMinRepeats: 32,
   streamMinChars: 320,
@@ -101,7 +93,6 @@ export function readOptions(env: Record<string, string | undefined> = process.en
     const n = Number(raw);
     return Number.isFinite(n) && n >= min ? n : fallback;
   };
-  const similarity = Number(env["PI_ANTI_LOOP_TEXT_SIMILARITY"] ?? "");
   return {
     repeatThreshold: num("PI_ANTI_LOOP_REPEATS", DEFAULT_OPTIONS.repeatThreshold),
     failThreshold: num("PI_ANTI_LOOP_FAILS", DEFAULT_OPTIONS.failThreshold),
@@ -111,9 +102,6 @@ export function readOptions(env: Record<string, string | undefined> = process.en
     failRateThreshold: Number.isFinite(failRate) ? Math.min(1, Math.max(0, failRate)) : 0,
     failRateMinCalls: num("PI_ANTI_LOOP_FAIL_RATE_MIN", DEFAULT_OPTIONS.failRateMinCalls),
     toolExclude,
-    textSimilarityThreshold: Number.isFinite(similarity)
-      ? Math.min(1, Math.max(0, similarity))
-      : (DEFAULT_OPTIONS.textSimilarityThreshold ?? 0.8),
     streamEnabled: env["PI_ANTI_LOOP_STREAM"] !== "0",
     streamMinRepeats: snum(
       "PI_ANTI_LOOP_STREAM_REPEATS",
@@ -255,9 +243,12 @@ export class LoopDetector {
   }
 
   /**
-   * Consecutive verbatim/near-identical assistant text (whitespace-normalized).
+   * Verbatim (exact) assistant-text signals, whitespace-normalized: a segment
+   * repeating within ONE message, the same message on consecutive turns, and the
+   * same message recurring within the recent window. There is deliberately NO
+   * fuzzy/similarity matching (see the streak block below for why).
    * The controller turns the first detection into a steer, later ones into
-   * aborts. $
+   * aborts.
    * Detects the text-only loop shape (model re-emits the same sentence
    * forever, e.g. goal-function loops) that identical-tool-call detection
    * never sees. Liquid.ai's Antidoom mines loops as 'a section repeats at
@@ -299,37 +290,18 @@ export class LoopDetector {
       });
     }
 
-    // Cross-message streak: consecutive assistant texts that are identical
-    // OR near-identical (token-overlap similarity). Catches loops where the
-    // model slightly rephrases each turn ("inspect the failing test" →
-    // "examine the failing assertion") so exact matching never fires.
-    const similarityFloor = this.opts.textSimilarityThreshold ?? TEXT_SIMILARITY_THRESHOLD;
-    const similar =
-      norm === this.lastText ||
-      (this.lastText !== null && tokenSimilarity(norm, this.lastText) >= similarityFloor);
-    this.textStreak = similar ? this.textStreak + 1 : 1;
+    // Cross-message streak: the SAME message (verbatim, after whitespace
+    // normalisation) on `textRepeatThreshold` consecutive turns — a strictly
+    // localised signal. We do NO fuzzy/similarity matching anywhere: an agent
+    // making real progress emits many turns that share heavy domain vocabulary,
+    // and token-overlap matching false-positives on those (it did more harm than
+    // good). Only verbatim repetition counts as a loop.
+    this.textStreak = norm === this.lastText ? this.textStreak + 1 : 1;
     this.lastText = norm;
     if (this.textStreak >= this.opts.textRepeatThreshold) {
       return Result.ok({
         reason:
-          `Assistant replied with identical or near-identical text ${this.textStreak} times in a row ` +
-          `("${truncate(norm, 80)}"). You appear to be in a loop.`,
-      });
-    }
-
-    // Cross-message window repeat (near-identical): a rotating set of
-    // rephrased commands ("Run the test." / "Run tests now." / "Let me run
-    // the test.") that is never identical and never consecutive, so both the
-    // exact window check and the streak above miss it. Similar, non-identical
-    // texts accumulating to textRepeatThreshold within the window fire here.
-    const similarCount =
-      this.recentTexts.filter(
-        (t) => t.text !== norm && tokenSimilarity(norm, t.text) >= similarityFloor,
-      ).length + 1;
-    if (similarCount >= this.opts.textRepeatThreshold) {
-      return Result.ok({
-        reason:
-          `Assistant sent near-identical text ${similarCount} times within the last ${this.opts.windowSize} messages ` +
+          `Assistant sent identical text ${this.textStreak} times in a row ` +
           `("${truncate(norm, 80)}"). You appear to be in a loop.`,
       });
     }
@@ -473,9 +445,6 @@ export function truncate(text: string, max: number): string {
 /** Minimum length of a segment worth treating as a repeated loop chunk. */
 export const MIN_REPEAT_CHUNK = 16;
 
-/** Jaccard similarity threshold for "near-identical" consecutive texts. */
-export const TEXT_SIMILARITY_THRESHOLD = 0.55;
-
 /** Stable string form of a tool input (used for token estimation). */
 export function stringify(input: ToolInput): string {
   return JSON.stringify(input) ?? "";
@@ -489,28 +458,6 @@ export function stringify(input: ToolInput): string {
 export function estimateTokens(text: string): number {
   if (!text) return 0;
   return Math.max(1, Math.ceil(text.length / 4));
-}
-
-/**
- * Token-set Jaccard similarity of two texts (case/whitespace-insensitive).
- * Short tokens (< 3 chars: "a", "me", "to") are ignored to reduce noise.
- * Returns 0..1; 1 = identical token sets.
- */
-export function tokenSimilarity(a: string, b: string): number {
-  const tokenize = (s: string) => {
-    return new Set(
-      normalizeText(s)
-        .toLowerCase()
-        .split(/\s+/g)
-        .filter((w) => w.length >= 3 && /^[a-z0-9_-]+$/.test(w)),
-    );
-  };
-  const as = tokenize(a);
-  const bs = tokenize(b);
-  if (as.size === 0 || bs.size === 0) return 0;
-  let inter = 0;
-  for (const t of as) if (bs.has(t)) inter++;
-  return inter / (as.size + bs.size - inter);
 }
 
 /**
@@ -696,9 +643,9 @@ if (import.meta.main) {
   d.checkText("");
   d.checkText("   ");
   assert.ok(d.checkText("").isErr(), "blank text must not fire");
-  // 11. text CYCLES: a small set of short near-identical commands rotating
-  //     ("Let me run. GO." / "Run. GO." / "GO.") never forms a consecutive
-  //     streak, but the same text reappears >= threshold within the window.
+  // 11. text CYCLES: the same few short messages rotating (verbatim,
+  //     not fuzzy) never form a consecutive streak, but the same text
+  //     reappears >= threshold within the window.
   d.reset();
   const cycle = [
     "Let me run. GO.",
@@ -715,7 +662,7 @@ if (import.meta.main) {
   ];
   let fired = false;
   for (const m of cycle) if (d.checkText(m).isOk()) fired = true;
-  assert.ok(fired, "rotating near-identical cycle must fire");
+  assert.ok(fired, "rotating verbatim cycle must fire");
 
   // 12. threshold 1 is clamped away (would brick the agent)
   const clamped = readOptions({

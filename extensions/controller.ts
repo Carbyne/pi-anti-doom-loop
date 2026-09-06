@@ -401,7 +401,7 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       return (
         `anti-doom-loop: repeats>=${o.repeatThreshold}/window ${o.windowSize}, ` +
         `fails>=${o.failThreshold}, text>=${o.textRepeatThreshold}, ` +
-        `sim>=${(o.textSimilarityThreshold ?? 0.8).toFixed(2)}, ${stream}${rate}${time}${excl}. ` +
+        `${stream}${rate}${time}${excl}. ` +
         `${detector.diagnostics()} steers=${steers} aborts=${aborts}${s}`
       );
     },

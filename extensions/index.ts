@@ -9,9 +9,11 @@
  *    in the last `PI_ANTI_LOOP_WINDOW` calls → block with an instructive reason
  *  - the same tool failing `PI_ANTI_LOOP_FAILS` consecutive times (default 3)
  *    → block with a "stop retrying, fix the root cause" reason
- *  - the model repeating text: verbatim, near-identical (token similarity),
- *    or a sentence repeated inside ONE message → steer first, abort as
+ *  - the model repeating the SAME text: verbatim across consecutive turns, the
+ *    same few messages cycling within the window, or a segment repeated inside
+ *    ONE message → steer first, abort as
  *    escalation, then a bounded auto-resume so work continues
+ *    (NO fuzzy/similarity matching — only verbatim repetition counts)
  *
  * Escalation (message loops): detection #1 steers the agent mid-run; #2
  * aborts the turn and queues one fresh-resume directive; #3+ aborts for real
@@ -69,17 +71,29 @@ export interface PiLike {
   getThinkingLevel?(): string;
 }
 
-/** Injected on the first loop detection — steer the agent back on track. */
+/**
+ * Injected on the first loop detection. It targets only the LOCAL repetition —
+ * break the stuck step — and explicitly tells the agent to KEEP the current task
+ * and goal. An earlier wording ("start over", "genuinely different approach",
+ * "re-read the task") risked derailing a long-running task over a transient
+ * local loop, which is strictly worse than the loop itself.
+ */
 const STEER_TEXT =
-  "Anti-doom-loop steering: you are repeating the same action or text without making progress. " +
-  "Stop. Re-read the actual error output, pick ONE different action, and execute it. " +
-  "If you are stuck, ask the user instead of retrying.";
+  "Anti-doom-loop: you've got stuck repeating the same action/text. Break just that one " +
+  "repeated step — try a different concrete action for it (a different tool, argument, or " +
+  "reading). Then CONTINUE the current task toward your existing goal: do not restart it, " +
+  "abandon it, or change direction. If this one step is genuinely blocked, ask the user.";
 
-/** Queued once after an abort so the work can continue with a fresh approach. */
+/**
+ * Queued once after an abort so the work continues. Task-preserving for the same
+ * reason as STEER_TEXT: recover from the local loop and carry on, don't reset the
+ * whole effort.
+ */
 const RESUME_TEXT =
-  "Anti-doom-loop: the previous run was aborted because it looped. " +
-  "Start over with a genuinely different approach: do not repeat the previous investigation steps. " +
-  "Re-read the task, choose one new action, execute it, then report results.";
+  "Anti-doom-loop: the last run was aborted because it was stuck repeating itself. Resume " +
+  "the SAME task you were working on — pick up where you left off. The one thing not to do " +
+  "is repeat the exact step that looped; take a different concrete action for that step, " +
+  "then keep going toward your existing goal.";
 
 /** Only the `input` event's presence matters here; its payload is ignored. */
 interface InputEventLite {

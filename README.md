@@ -8,15 +8,19 @@ iteration is so cheap nobody notices until the bill mounts. This extension
 watches every tool call and blocks the loop at the source.
 
 > **Fork note.** This is a Carbyne fork of
-> [`irfndi/pi-anti-doom-loop`](https://github.com/irfndi/pi-anti-doom-loop). It keeps every
-> upstream detector (tool-call / verbatim / near-identical / duplicate-batch) and adds one the
-> original can't see: a **mid-stream intra-turn repetition guard** for a single streamed
-> assistant turn that never terminates while repeating a short fragment (`…ductductduct…`).
-> That turn never reaches `message_end`, so the cross-message text detectors are blind to it —
-> this guard evaluates the `message_update` deltas directly instead. The fork also ships
-> **conservative** text defaults (text-repeat threshold `5`, near-identical similarity `0.8`)
-> and exposes the similarity threshold, so a legitimately rephrasing main agent trips it far
-> less often.
+> [`irfndi/pi-anti-doom-loop`](https://github.com/irfndi/pi-anti-doom-loop). It keeps the
+> upstream tool-call / verbatim / duplicate-batch detectors and adds one the original can't
+> see: a **mid-stream intra-turn repetition guard** for a single streamed assistant turn that
+> never terminates while repeating a short fragment (`…ductductduct…`). That turn never
+> reaches `message_end`, so the cross-message text detectors are blind to it — this guard
+> evaluates the `message_update` deltas directly instead.
+>
+> **We removed the upstream *near-identical* (token-similarity) text detectors entirely.** An
+> agent making real progress emits many turns that share heavy domain vocabulary, and fuzzy
+> similarity matching false-positives on those — it did more harm than good. Detection is now
+> strictly **localised and verbatim**: an intra-turn token collapse, or the **exact same**
+> message repeating (consecutively, or the same few turns cycling in the window). Nothing with
+> less-than-1.0 similarity is ever treated as a loop.
 
 ## Install
 
@@ -34,10 +38,9 @@ pi install npm:pi-anti-doom-loop
 | ------------------------------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Same `(tool, args)` repeated                            | 3× in the last 10 calls       | The pattern has repeated `3` times with no change                                                                                                    |
 | Same tool failing consecutively                         | 3×                            | A tool errored `3` times in a row — stop retrying it blindly                                                                                         |
-| Same assistant text verbatim                            | 5× within the last N messages | The model re-emitted identical text `5` times inside the sliding window                                                                              |
+| Same assistant text verbatim (consecutive)              | 5× in a row                   | The model re-emitted the **identical** message `5` turns in a row                                                                                     |
+| Same assistant text verbatim (window cycle)             | 5× within the last N messages | The **identical** message re-appears `5` times inside the sliding window (the same few turns cycling)                                                 |
 | Same sentence inside ONE message                        | 5×                            | A sentence repeats `5`+ times within a single message (growing self-concatenation loops)                                                             |
-| Near-identical text (rephrasing)                        | 5× in a row                   | Consecutive messages share ≥80% tokens — the model is rephrasing the same step                                                                       |
-| Near-identical text cycle (rotating rephrased commands) | 5× within the last N messages | Near-identical assistant texts (≥80% token similarity) accumulate to the repeat threshold in the window, even when not identical and not consecutive |
 | Mid-stream token collapse (`duct duct…`)                | `on`, ×32 over 320 chars      | One streamed assistant turn repeats a ≤32-char unit ≥`32` times (or exceeds `40000` chars) without ever ending — the shape `message_end` cannot see  |
 
 Blocks hand the model an instructive reason ("change your approach, use a
@@ -121,8 +124,7 @@ Environment variables, read at session/prompt start:
 | ------------------------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PI_ANTI_LOOP_REPEATS`               | `3`     | Identical-call block threshold                                                                                                                      |
 | `PI_ANTI_LOOP_FAILS`                 | `3`     | Consecutive-failure block threshold                                                                                                                 |
-| `PI_ANTI_LOOP_TEXT_REPEATS`          | `5`     | Window/cycle repeat threshold for identical and near-identical assistant texts                                                                      |
-| `PI_ANTI_LOOP_TEXT_SIMILARITY`       | `0.8`   | Token-overlap similarity `0..1` counted as "near-identical". **Higher = more conservative** (fewer false positives on legitimately rephrased steps) |
+| `PI_ANTI_LOOP_TEXT_REPEATS`          | `5`     | Repeat threshold for verbatim assistant-text signals (consecutive streak and window cycle)                                                            |
 | `PI_ANTI_LOOP_STREAM`                | `1`     | Mid-stream intra-turn repetition guard; set `0` to disable it                                                                                       |
 | `PI_ANTI_LOOP_STREAM_REPEATS`        | `32`    | Whole copies of a short unit before the mid-stream guard fires (min 4)                                                                              |
 | `PI_ANTI_LOOP_STREAM_MIN_CHARS`      | `320`   | Trailing window that must be tiled to count as a loop (min 40)                                                                                      |

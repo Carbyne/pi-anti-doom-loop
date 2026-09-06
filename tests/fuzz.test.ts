@@ -226,9 +226,8 @@ describe("fuzz: within-message self-repetition", () => {
       "gateway",
     ];
     for (let i = 0; i < 300; i++) {
-      // Each message: 6 random DISTINCT words + a unique marker, so two
-      // consecutive messages share almost no tokens (similarity stays low)
-      // and no sentence repeats inside one message.
+      // Each message: 6 random DISTINCT words + a unique marker, so no two
+      // messages are ever identical and no sentence repeats inside one message.
       const words = new Set<string>();
       while (words.size < 6) words.add(pool[Math.floor(rand() * pool.length)]);
       const text = [...words].join(" ") + ` marker-${i}`;

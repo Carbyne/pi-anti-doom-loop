@@ -11,7 +11,6 @@ import {
   normalizeText,
   truncate,
   repeatedSegment,
-  tokenSimilarity,
   detectRepetition,
   readOptions,
   DEFAULT_OPTIONS,
@@ -367,7 +366,7 @@ describe("verbatim text detection", () => {
     assert.ok(d.checkText("C").isErr(), "2 recurrences in the window must not fire");
     assert.ok(d.checkText("A").isOk(), "3rd recurrence in the window fires");
   });
-  it("detects a rotating near-identical command cycle", () => {
+  it("detects a rotating verbatim command cycle (exact repeats within the window)", () => {
     const d = new LoopDetector(opts);
     const cycle = [
       "Let me run. GO.",
@@ -384,7 +383,7 @@ describe("verbatim text detection", () => {
     ];
     let fired = false;
     for (const m of cycle) if (d.checkText(m).isOk()) fired = true;
-    assert.ok(fired, "rotating near-identical cycle must fire");
+    assert.ok(fired, "rotating verbatim cycle must fire");
   });
 
   it("blank text is ignored", () => {
@@ -468,78 +467,56 @@ describe("within-message detection through checkText", () => {
   });
 });
 
-describe("near-identical text (tokenSimilarity)", () => {
-  it("returns high similarity for lightly rephrased sentences", () => {
-    const a = "Let me re-download the log and inspect the failing test";
-    const b = "Let me re-download the log and examine the failing assertion";
-    assert.ok(tokenSimilarity(a, b) >= 0.5, `similarity too low: ${tokenSimilarity(a, b)}`);
-    assert.equal(tokenSimilarity(a, a), 1);
-  });
-
-  it("returns low similarity for unrelated sentences", () => {
-    const s = tokenSimilarity(
-      "Open the file and read the tests",
-      "Deploy the service to production now",
-    );
-    assert.ok(s < 0.3, `expected low similarity, got ${s}`);
-  });
-
-  it("ignores short tokens and case", () => {
-    assert.equal(
-      tokenSimilarity("Go now!", "Go now!"),
-      0,
-      "tokens shorter than 3 chars are ignored",
-    );
-    assert.equal(tokenSimilarity("Read THE File", "read the file"), 1);
-  });
-
-  it("fires a streak on near-identical consecutive messages", () => {
+describe("verbatim-only text detection (no similarity matching)", () => {
+  it("does NOT fire on heavily rephrased-but-similar consecutive messages", () => {
     const d = new LoopDetector(opts);
     const variants = [
       "Let me re-download the log and inspect the failing test",
       "Let me re-download the log and examine the failing assertion",
       "Let me re-download the run log and inspect the failing test's assertion",
+      "Let me re-download the run log and inspect the failing test assertion again",
+      "Let me re-download the run log and inspect the failing test once more",
     ];
-    assert.ok(d.checkText(variants[0]).isErr());
-    assert.ok(d.checkText(variants[1]).isErr(), "2nd similar message: streak 2");
-    const hit = d.checkText(variants[2]);
-    assert.ok(hit.isOk(), "3rd similar message fires");
-    if (hit.isOk()) assert.match(hit.value.reason, /identical or near-identical text 3 times/);
-  });
-
-  it("a genuinely different message does NOT let 3 near-identical texts escape detection", () => {
-    const d = new LoopDetector(opts);
-    d.checkText("Let me re-download the log and inspect the failing test");
-    d.checkText("Let me re-download the log and examine the failing assertion");
-    d.checkText("The build passed and all tests are green now");
-    d.checkText("Let me re-download the log and inspect the failing test");
-    // Message 5 is near-identical to messages 1, 2 and 4 within the window, so
-    // the near-identical window repeat (feature A) fires even though the
-    // interleaved message reset the consecutive streak.
-    const hit = d.checkText("Let me re-download the log and examine the failing assertion");
-    assert.ok(hit.isOk(), "near-identical texts spread across the window must fire");
-    if (hit.isOk()) {
-      assert.match(hit.value.reason, /near-identical text 3 times within the last/);
+    for (const v of variants) {
+      assert.ok(d.checkText(v).isErr(), `a rephrased message must never fire: ${v}`);
     }
   });
 
-  it("fires a near-identical window repeat on a rotating, non-consecutive cycle", () => {
+  it("does NOT fire on a rotating set of similar-but-distinct commands in the window", () => {
     const d = new LoopDetector(opts);
-    // Three lightly rephrased commands (mutually similar but never identical),
-    // interleaved with a genuinely different message so the consecutive streak
-    // stays at 1. Feature A fires when the window accumulates 3 similar texts.
-    const t1 = "Run the test suite and report the failures now";
-    const t2 = "Run the test suite and report the failures please";
-    const t3 = "Run the test suite and report the failures today";
-    const diff = "The build passed so we deploy the app to production";
-    assert.ok(d.checkText(t1).isErr());
-    assert.ok(d.checkText(t2).isErr(), "2nd similar message: streak 2, window 2 — not yet");
-    assert.ok(d.checkText(diff).isErr(), "different message keeps the streak at 1");
-    const hit = d.checkText(t3);
-    assert.ok(hit.isOk(), "3 near-identical texts in the window must fire");
-    if (hit.isOk()) {
-      assert.match(hit.value.reason, /near-identical text 3 times within the last/);
+    const cmds = [
+      "Run the test suite and report the failures now",
+      "Run the test suite and report the failures please",
+      "Run the test suite and report the failures today",
+      "Run the test suite and report the failures soon",
+      "Run the test suite and report the failures later",
+    ];
+    for (const t of cmds) {
+      assert.ok(d.checkText(t).isErr(), `a distinct (never-identical) text must not fire: ${t}`);
     }
+  });
+
+  it("DOES fire when the exact same message repeats consecutively", () => {
+    const d = new LoopDetector(opts);
+    assert.ok(d.checkText("Checking the GPIO registers.").isErr());
+    assert.ok(d.checkText("Checking the GPIO registers.").isErr());
+    const hit = d.checkText("Checking the GPIO registers.");
+    assert.ok(hit.isOk(), "3 verbatim consecutive messages fire");
+    if (hit.isOk()) assert.match(hit.value.reason, /identical text 3 times/);
+  });
+
+  it("DOES fire when the exact same few messages cycle within the window", () => {
+    const d = new LoopDetector(opts);
+    // A,B,A,B,... — the same two messages cycling. Exact, verbatim, so this is
+    // the "looping the exact same few full turns multiple times" case.
+    const a = "Reading the peripheral state struct.";
+    const b = "Cross-checking the RAM map against it.";
+    let fired = false;
+    for (let i = 0; i < 8; i++) {
+      const m = i % 2 === 0 ? a : b;
+      if (d.checkText(m).isOk()) fired = true;
+    }
+    assert.ok(fired, "the same message recurring >= threshold within the window fires");
   });
 });
 

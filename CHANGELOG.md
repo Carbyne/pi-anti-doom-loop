@@ -2,6 +2,27 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.1.4] — Carbyne fork
+
+### Removed / Fixed
+
+- **Dropped the near-identical (token-similarity) text detectors entirely.** They were
+  far too aggressive: an agent making real progress emits many turns that share heavy
+  domain vocabulary, and Jaccard token-overlap matching false-positived on those. In a
+  real reverse-engineering session the old detector flagged **essentially every**
+  consecutive assistant message as a "loop". Detection is now strictly localised and
+  verbatim: an intra-turn token collapse (mid-stream guard), or the **exact same**
+  message repeating (a verbatim consecutive streak, or the same few messages cycling in
+  the window). Nothing below `1.0` similarity is ever a loop.
+- **Root cause of the runaway streak was a config bug**, now moot but instructive: an
+  unset `PI_ANTI_LOOP_TEXT_SIMILARITY` hit `Number("") === 0` (not `NaN`) with
+  `Number.isFinite(0) === true`, so the `0.8` default was silently overwritten with `0`
+  — and a similarity floor of `0` makes *every* consecutive pair "near-identical". Since
+  similarity is gone, `PI_ANTI_LOOP_TEXT_SIMILARITY` / `tokenSimilarity` /
+  `TEXT_SIMILARITY_THRESHOLD` are removed.
+- Tests: near-identical suites replaced with verbatim-only regression guards that assert
+  rephrased/similar-but-distinct messages **never** fire, while exact repeats/cycles do.
+
 ## [0.1.3] — Carbyne fork
 
 ### Fixed
