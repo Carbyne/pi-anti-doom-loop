@@ -245,6 +245,21 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
   let streamTotal = 0;
   let streamSince = 0;
   let streamSteered = false;
+  // Separate buffer for the streamed TOOL-CALL argument text, guarded with its
+  // own stricter (zero-noise) thresholds so a legitimate large file write is
+  // never mistaken for a collapse.
+  let toolBuf = "";
+  let toolSince = 0;
+
+  // Single-shot mid-stream abort helper shared by the prose and tool-call paths.
+  const streamAbort = (reason: string): TextLoopOutcome => {
+    aborts++;
+    if (resumes < RESUME_BUDGET) {
+      resumes++;
+      return { reason, action: "abort", resume: true };
+    }
+    return { reason, action: "abort", resume: false };
+  };
 
   return {
     onToolCall(toolName, input, toolCallId) {
@@ -307,14 +322,46 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       streamTotal = 0;
       streamSince = 0;
       streamSteered = false;
+      toolBuf = "";
+      toolSince = 0;
     },
 
     onMessageUpdate(role, deltaType, delta) {
       if (suspended) return null;
       if (role !== "assistant") return null;
       if (opts.streamEnabled === false) return null;
-      if (deltaType !== "text" && deltaType !== "thinking") return null;
       if (!delta) return null;
+      if (streamSteered) return null; // already aborted this turn (single-shot gate)
+
+      const isTool = deltaType === "toolcall";
+      if (!isTool && deltaType !== "text" && deltaType !== "thinking") return null;
+      if (isTool && opts.streamToolEnabled === false) return null;
+
+      // Tool-call argument stream and generated prose are guarded SEPARATELY.
+      // The per-turn char cap never applies to tool args (a legitimately large
+      // file write must not be aborted), and the tool-arg periodicity is far
+      // stricter — zero noise, larger window, tighter period — so only a blatant
+      // collapse inside a tool call trips it.
+      if (isTool) {
+        toolBuf += delta;
+        toolSince += delta.length;
+        const tkeep = Math.max((opts.streamToolMinChars ?? 1600) * 2, 1024);
+        if (toolBuf.length > tkeep) toolBuf = toolBuf.slice(toolBuf.length - tkeep);
+        if (toolSince < STREAM_CHECK_STRIDE) return null;
+        toolSince = 0;
+        const tdet = detectRepetition(toolBuf, {
+          minRepeats: opts.streamToolMinRepeats ?? 100,
+          minChars: opts.streamToolMinChars ?? 1600,
+          maxPeriod: opts.streamToolMaxPeriod ?? 12,
+          noiseRatio: 0, // perfect tiling only — real data breaks a block at once
+        });
+        if (!tdet) return null;
+        streamSteered = true;
+        return streamAbort(
+          `assistant tool call is stuck repeating "${truncate(tdet.sample, 24)}" ` +
+            `(${tdet.periodLength}-char unit) ~${tdet.repeats} times`,
+        );
+      }
 
       streamBuf += delta;
       streamTotal += delta.length;
@@ -337,21 +384,11 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
         ? `assistant turn is stuck repeating "${truncate(det.sample, 24)}" (${det.periodLength}-char unit) ~${det.repeats} times`
         : `assistant turn ran to ${streamTotal} chars of generated text without stopping`;
 
-      // A live mid-stream repetition can't be steered out — a steer message
-      // would only be observed once this never-ending turn ended, which defeats
-      // the point — so abort in ONE shot. `streamSteered` is the single-shot
-      // gate: a sustained burst of the same collapse consumes exactly ONE
-      // resume (previously it charged both a steer and an abort, burning the
-      // budget before the corrective turn even ran, which stalled on the very
-      // next detection). The next assistant turn starts with a fresh chance.
-      if (streamSteered) return null; // already aborted this turn
+      // A live mid-stream repetition can't be steered out — abort in ONE shot.
+      // `streamSteered` is the single-shot gate shared across the prose and tool
+      // paths, so a sustained burst costs exactly ONE resume.
       streamSteered = true;
-      aborts++;
-      if (resumes < RESUME_BUDGET) {
-        resumes++;
-        return { reason, action: "abort", resume: true };
-      }
-      return { reason, action: "abort", resume: false };
+      return streamAbort(reason);
     },
 
     reset() {
@@ -363,6 +400,8 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       streamTotal = 0;
       streamSince = 0;
       streamSteered = false;
+      toolBuf = "";
+      toolSince = 0;
       // resumes/steers/aborts are intentionally NOT reset here: they are
       // session-scoped so a stuck model cannot cycle steer→abort forever and
       // /loopcheck can report lifetime counters. The auto-resume budget is
@@ -397,7 +436,10 @@ export function createController(opts: LoopOptions = readOptions()): AntiLoopCon
       const stream =
         o.streamEnabled === false
           ? "stream=off"
-          : `stream=on(×${o.streamMinRepeats ?? 32}/${o.streamMaxPeriod ?? 32}ch)`;
+          : `stream=on(×${o.streamMinRepeats ?? 32}/${o.streamMaxPeriod ?? 32}ch)` +
+            (o.streamToolEnabled === false
+              ? ""
+              : `+tool(×${o.streamToolMinRepeats ?? 100}/${o.streamToolMaxPeriod ?? 12}ch)`);
       return (
         `anti-doom-loop: repeats>=${o.repeatThreshold}/window ${o.windowSize}, ` +
         `fails>=${o.failThreshold}, text>=${o.textRepeatThreshold}, ` +

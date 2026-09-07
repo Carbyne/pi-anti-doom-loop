@@ -42,6 +42,7 @@ pi install npm:pi-anti-doom-loop
 | Same assistant text verbatim (window cycle)             | 5× within the last N messages | The **identical** message re-appears `5` times inside the sliding window (the same few turns cycling)                                                 |
 | Same sentence inside ONE message                        | 5×                            | A sentence repeats `5`+ times within a single message (growing self-concatenation loops)                                                             |
 | Mid-stream token collapse (`duct duct…`)                | `on`, ×32 over 320 chars      | One streamed assistant turn repeats a ≤32-char unit ≥`32` times (or exceeds `40000` chars) without ever ending — the shape `message_end` cannot see  |
+| Mid-stream collapse in TOOL-CALL args                   | `on`, ×100 over 1600 (zero-noise) | The same collapse shape hidden inside a streamed tool-call's arguments; only a perfect short-unit tiling fires, so a real/diverse file write is never aborted |
 
 Blocks hand the model an instructive reason ("change your approach, use a
 different tool, or ask the user"). If the model ignores the block and re-issues
@@ -78,13 +79,18 @@ than wasting a steer the same model would just collapse through:
   most `PI_ANTI_LOOP_STREAM_MAX_PERIOD` chars, repeated at least `PI_ANTI_LOOP_STREAM_REPEATS`
   whole times (allowing ≤12% per-block noise), or once a turn passes
   `PI_ANTI_LOOP_STREAM_MAX_TURN_CHARS` generated chars;
-- it scans **prose only** — a consolidator/agent legitimately streaming a large file (which
-  arrives as `toolcall_delta`) is **never** mistaken for a loop;
+- it guards **two separate buffers**: generated prose/thinking (the ordinary bar) and the
+  streamed **tool-call argument** text. A collapse can hide inside a file write's args, so
+  `toolcall_delta` **is** scanned — but with a **far stricter** bar (perfect zero-noise tiling
+  of a ≤12-char unit over 1600 chars) and it is **exempt from the char cap**, so a legitimately
+  large/diverse write is never mistaken for a loop;
 - a candidate unit that is only whitespace/punctuation is ignored, so pasted tables and
   dividers don't false-positive.
 
-Set `PI_ANTI_LOOP_STREAM=0` to disable it. Defaults are deliberately conservative because it
-acts on the user's own interactive turn, not just cheap worker subprocesses.
+Set `PI_ANTI_LOOP_STREAM=0` to disable the whole guard, or `PI_ANTI_LOOP_STREAM_TOOL=0` to
+keep the prose guard but stop scanning tool-call arguments. Defaults are deliberately
+conservative because it acts on the user's own interactive turn, not just cheap worker
+subprocesses.
 
 ### Thinking reduction on loop
 
@@ -130,6 +136,10 @@ Environment variables, read at session/prompt start:
 | `PI_ANTI_LOOP_STREAM_MIN_CHARS`      | `320`   | Trailing window that must be tiled to count as a loop (min 40)                                                                                      |
 | `PI_ANTI_LOOP_STREAM_MAX_PERIOD`     | `32`    | Largest candidate unit length for the mid-stream guard (min 2)                                                                                      |
 | `PI_ANTI_LOOP_STREAM_MAX_TURN_CHARS` | `40000` | Hard per-turn generated-char cap; beyond it the mid-stream guard fires (min 1000)                                                                   |
+| `PI_ANTI_LOOP_STREAM_TOOL`             | `1`     | Also guard the streamed tool-call **argument** buffer; set `0` to scan prose/thinking only                                                           |
+| `PI_ANTI_LOOP_STREAM_TOOL_REPEATS`     | `100`   | Tool-arg guard: whole copies of a short unit before it fires (far stricter than prose; min 8)                                                       |
+| `PI_ANTI_LOOP_STREAM_TOOL_MIN_CHARS`   | `1600`  | Tool-arg guard: trailing window that must tile PERFECTLY (zero noise) to count as a loop (min 200)                                                  |
+| `PI_ANTI_LOOP_STREAM_TOOL_MAX_PERIOD`  | `12`    | Tool-arg guard: largest candidate unit length (short on purpose; min 2)                                                                              |
 | `PI_ANTI_LOOP_WINDOW`                | `10`    | How many recent calls/results are inspected                                                                                                         |
 | `PI_ANTI_LOOP_TIME_WINDOW`           | `0`     | Elapsed-time window in ms (`0` = disabled, count-only): evicts window entries older than this so slow chronic loops over a long session are caught  |
 | `PI_ANTI_LOOP_FAIL_RATE`             | `0`     | Fail-rate block threshold `0..1` (`0` = disabled): block when a tool's error share of its in-window calls reaches this                              |

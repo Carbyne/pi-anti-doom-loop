@@ -2,6 +2,24 @@
 
 All notable changes to **pi-anti-doom-loop**.
 
+## [0.1.5] — Carbyne fork
+
+### Added
+
+- **Mid-stream guard for tool-call argument streams.** A repetition collapse can hide
+  inside a streamed tool call's **arguments** (e.g. the model emits a `write` whose content
+  is `duct duct…`), and because that turn never ends, `message_end` never fires to catch
+  it. The `message_update` handler now routes `toolcall_delta` into its **own** buffer.
+- To avoid the whole reason tool args were previously excluded — never aborting a
+  **legitimate large/diverse file write** — the tool-arg guard is **far stricter** than the
+  prose guard and is **exempt from the per-turn char cap**: it requires a **perfect
+  zero-noise** tiling of a ≤12-char unit over 1600 chars (`PI_ANTI_LOOP_STREAM_TOOL*`). Real
+  content (varied values, line numbers, JSON escapes, long lines whose period exceeds
+  `maxPeriod`) never tiles perfectly, so it is never aborted; only a blatant collapse at
+  the tail of the args trips it. Set `PI_ANTI_LOOP_STREAM_TOOL=0` to scan prose/thinking
+  only. A shared single-shot gate makes a mid-stream collapse (prose **or** tool args) cost
+  exactly one resume per turn.
+
 ## [0.1.4] — Carbyne fork
 
 ### Removed / Fixed

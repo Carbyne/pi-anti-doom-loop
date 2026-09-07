@@ -400,11 +400,13 @@ describe("controller: mid-stream intra-turn guard", () => {
     const o2 = c.onMessageUpdate("assistant", "text", duct);
     assert.equal(o2, null, "sustained same-turn burst is single-shot (not double-charged)");
   });
-  it("ignores non-text deltas and non-assistant roles", () => {
+  it("ignores non-assistant roles and tool-call text below the strict collapse bar", () => {
     const c = createController(stream);
     c.onMessageStart();
+    // A non-assistant role is never scanned.
+    assert.equal(c.onMessageUpdate("user", "text", "duct".repeat(400)), null);
+    // 1200 chars of "duct" in tool args is BELOW the strict 1600-char bar → not aborted.
     assert.equal(c.onMessageUpdate("assistant", "toolcall", "duct".repeat(300)), null);
-    assert.equal(c.onMessageUpdate("user", "text", "duct".repeat(300)), null);
   });
   it("does not fire on ordinary prose", () => {
     const c = createController(stream);
@@ -477,7 +479,28 @@ describe("index adapter: message_update mid-stream guard", () => {
       undefined,
     );
   });
-  it("never scans toolcall_delta (a big file write is not a loop)", () => {
+  it("does not abort a legitimate (diverse) tool-call write", () => {
+    const { pi, fire } = makeFakePi();
+    indexDefault(pi);
+    let aborts = 0;
+    const ctx = {
+      ...fakeCtx(),
+      abort: () => {
+        aborts++;
+      },
+    };
+    fire("message_start", { message: { role: "assistant" } }, ctx);
+    let big = '{"path":"src/gen.ts","content":"';
+    for (let i = 0; i < 2000; i++) big += `line${i} = value${(i * 7) % 1000};\n`;
+    big += '"}';
+    fire(
+      "message_update",
+      { assistantMessageEvent: { type: "toolcall_delta", delta: big } },
+      ctx,
+    );
+    assert.equal(aborts, 0, "a big but diverse write is never mistaken for a collapse");
+  });
+  it("aborts a collapse hidden in the tool-call argument stream", () => {
     const { pi, fire, sent } = makeFakePi();
     indexDefault(pi);
     let aborts = 0;
@@ -490,10 +513,11 @@ describe("index adapter: message_update mid-stream guard", () => {
     fire("message_start", { message: { role: "assistant" } }, ctx);
     fire(
       "message_update",
-      { assistantMessageEvent: { type: "toolcall_delta", delta: "x".repeat(20000) } },
+      { assistantMessageEvent: { type: "toolcall_delta", delta: "duct".repeat(600) } },
       ctx,
     );
-    assert.equal(sent.length, 0);
-    assert.equal(aborts, 0);
+    assert.equal(aborts, 1, "a perfect short-unit collapse in tool args aborts");
+    assert.equal(sent.length, 1, "a fresh-approach resume was queud");
+    assert.equal(sent[0].options?.deliverAs, "followUp");
   });
 });

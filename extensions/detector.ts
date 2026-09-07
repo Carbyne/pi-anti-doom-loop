@@ -45,6 +45,15 @@ export interface LoopOptions {
   streamMaxPeriod?: number;
   /** Hard per-turn generated-text cap; beyond it the stream guard fires. 0 disables the cap. */
   streamMaxTurnChars?: number;
+  /** Guard the streamed TOOL-CALL argument buffer too (a collapse can hide in a
+   *  file write's args). On unless `false`. Uses the stricter `streamTool*` set. */
+  streamToolEnabled?: boolean;
+  /** Tool-arg guard: whole copies of a short unit before it fires. */
+  streamToolMinRepeats?: number;
+  /** Tool-arg guard: trailing window that must tile PERFECTLY to count as a loop. */
+  streamToolMinChars?: number;
+  /** Tool-arg guard: largest candidate period length. */
+  streamToolMaxPeriod?: number;
 }
 
 export const DEFAULT_OPTIONS: LoopOptions = {
@@ -66,6 +75,17 @@ export const DEFAULT_OPTIONS: LoopOptions = {
   streamMinChars: 320,
   streamMaxPeriod: 32,
   streamMaxTurnChars: 40_000,
+  // Tool-call argument stream: deliberately FAR stricter than the prose guard.
+  // A legitimate large file write streams diverse text here, so we require a
+  // PERFECT (zero-noise) tiling of a very short unit over a large trailing
+  // window before treating it as a collapse — only a blatant `duct duct…` at the
+  // tail of a tool call trips this; real content (varied values, line numbers,
+  // JSON escapes, long lines whose period exceeds maxPeriod) never tiles
+  // perfectly. Tune via PI_ANTI_LOOP_STREAM_TOOL*.
+  streamToolEnabled: true,
+  streamToolMinRepeats: 100,
+  streamToolMinChars: 1600,
+  streamToolMaxPeriod: 12,
 };
 
 export function readOptions(env: Record<string, string | undefined> = process.env): LoopOptions {
@@ -122,6 +142,22 @@ export function readOptions(env: Record<string, string | undefined> = process.en
       "PI_ANTI_LOOP_STREAM_MAX_TURN_CHARS",
       1_000,
       DEFAULT_OPTIONS.streamMaxTurnChars ?? 40_000,
+    ),
+    streamToolEnabled: env["PI_ANTI_LOOP_STREAM_TOOL"] !== "0",
+    streamToolMinRepeats: snum(
+      "PI_ANTI_LOOP_STREAM_TOOL_REPEATS",
+      8,
+      DEFAULT_OPTIONS.streamToolMinRepeats ?? 100,
+    ),
+    streamToolMinChars: snum(
+      "PI_ANTI_LOOP_STREAM_TOOL_MIN_CHARS",
+      200,
+      DEFAULT_OPTIONS.streamToolMinChars ?? 1600,
+    ),
+    streamToolMaxPeriod: snum(
+      "PI_ANTI_LOOP_STREAM_TOOL_MAX_PERIOD",
+      2,
+      DEFAULT_OPTIONS.streamToolMaxPeriod ?? 12,
     ),
   };
 }
@@ -504,6 +540,9 @@ export interface RepetitionConfig {
   minChars: number;
   /** Largest candidate period. */
   maxPeriod: number;
+  /** Per-block char-mismatch tolerance as a fraction of the period (default 0.12).
+   *  Pass 0 to require PERFECT tiling (used for the strict tool-call guard). */
+  noiseRatio?: number;
 }
 export interface RepetitionDetection {
   periodLength: number;
@@ -516,11 +555,12 @@ const REPETITION_NOISE_RATIO = 0.12;
 export function detectRepetition(text: string, cfg: RepetitionConfig): RepetitionDetection | null {
   const { minRepeats, minChars, maxPeriod } = cfg;
   if (minChars <= 0 || minRepeats < 2 || text.length < minChars) return null;
+  const noise = cfg.noiseRatio ?? REPETITION_NOISE_RATIO;
   const cap = Math.min(maxPeriod, text.length);
   for (let p = 1; p <= cap; p++) {
     const unit = text.slice(text.length - p);
     if (!/[a-zA-Z0-9]/.test(unit)) continue; // skip whitespace/punct-only "periods"
-    const allowed = Math.floor(p * REPETITION_NOISE_RATIO);
+    const allowed = Math.floor(p * noise);
     let blocks = 0;
     let i = text.length;
     while (i - p >= 0) {

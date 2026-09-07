@@ -208,9 +208,11 @@ export default function (pi: PiLike): void {
 
   // Mid-stream intra-turn repetition ("duct duct…"): the model streams one
   // never-terminating turn, so message_end never fires and the cross-message
-  // text signals are blind to it. Watch the streaming deltas instead. Only
-  // text/thinking deltas are scanned — tool-call arg deltas (a consolidator
-  // legitimately writing a large file) are NEVER treated as a doom loop.
+  // text signals are blind to it. Watch the streaming deltas instead, in TWO
+  // separate buffers: generated prose/thinking (the ordinary guard) and the
+  // TOOL-CALL argument stream (a collapse can hide in a file write's args). The
+  // tool-arg buffer is guarded with far stricter, zero-noise thresholds and is
+  // exempt from the per-turn char cap, so a legitimate large write is not aborted.
   pi.on("message_start", (event: MessageStartEventLite) => {
     const role = event.message?.role;
     if (role === undefined || role === "assistant") controller.onMessageStart();
@@ -220,8 +222,14 @@ export default function (pi: PiLike): void {
     const ae = event.assistantMessageEvent;
     if (!ae) return;
     const deltaType =
-      ae.type === "text_delta" ? "text" : ae.type === "thinking_delta" ? "thinking" : null;
-    if (deltaType === null) return; // toolcall_delta etc. is not generated prose
+      ae.type === "text_delta"
+        ? "text"
+        : ae.type === "thinking_delta"
+          ? "thinking"
+          : ae.type === "toolcall_delta"
+            ? "toolcall"
+            : null;
+    if (deltaType === null) return; // other deltas (signature, etc.) aren't generated content
     const outcome = controller.onMessageUpdate("assistant", deltaType, ae.delta ?? "");
     if (outcome === null) return;
     // Mid-stream returns only "abort": a live repetition can't be steered out
